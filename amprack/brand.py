@@ -30,6 +30,35 @@ def icon():
     return ic
 
 
+WORDMARK = (Path(__file__).resolve().parent.parent / "assets" / "brand" / "bilingual"
+            / "tanin-wordmark-d-horizontal-dark.svg")
+
+
+def wordmark_pixmap(height: int, dpr: float = 1.0):
+    """The 'Tanin | طنين' wordmark rendered crisp at the given logical height.
+    Returns None if the file or Qt SVG support is missing, so callers can fall
+    back to plain text."""
+    try:
+        from PySide6.QtCore import QRectF, Qt
+        from PySide6.QtGui import QPainter, QPixmap
+        from PySide6.QtSvg import QSvgRenderer
+    except Exception:
+        return None
+    r = QSvgRenderer(str(WORDMARK))
+    if not r.isValid():
+        return None
+    size = r.defaultSize()
+    w = height * size.width() / max(1, size.height())
+    pm = QPixmap(int(w * dpr), int(height * dpr))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    r.render(p, QRectF(0, 0, pm.width(), pm.height()))
+    p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
 def apply(app) -> None:
     """Call right after creating the QApplication, before any window is shown."""
     _set_windows_app_id()

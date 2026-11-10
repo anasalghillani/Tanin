@@ -147,8 +147,15 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(18, 10, 12, 10)
         h.setSpacing(8)
 
-        title = QLabel("TANIN")
-        title.setObjectName("Brand")
+        from .. import brand
+        title = QLabel()
+        pm = brand.wordmark_pixmap(34, self.devicePixelRatioF())
+        if pm is not None:
+            title.setPixmap(pm)
+        else:
+            title.setText("TANIN")
+            title.setObjectName("Brand")
+        title.setToolTip("Tanin · طنين")
         title.setFixedWidth(206)
         h.addWidget(title)
 
