@@ -312,27 +312,88 @@ class Engine:
 
         For anything that would resize or swap a buffer. deque.append and
         popleft are atomic in CPython, so this needs no lock.
+
+        With no stream running there is no audio thread to race and no block
+        to wait for, so it runs right away. Queuing it instead would leave it
+        sitting there until the next start, which used to throw it away.
         """
-        self._commands.append(fn)
+        if self.running and self.stream is not None:
+            self._commands.append(fn)
+        else:
+            fn()
+
+    def _drain_commands(self) -> None:
+        """Run everything still queued. Control thread, stream not running."""
+        while True:
+            try:
+                fn = self._commands.popleft()
+            except IndexError:
+                return
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                self.last_callback_exc = repr(exc)
+
+    def _read_ir(self, path: str):
+        """Read, resample and FFT an IR file. Control thread only."""
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float64", always_2d=True)
+        ir = data[:, 0]
+        if abs(sr - self.samplerate) > 1:
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(int(sr), int(self.samplerate))
+            ir = resample_poly(ir, int(self.samplerate) // g, int(sr) // g)
+        return self.chain["ir"].build_kernel(ir)
 
     def load_ir(self, path: str) -> str:
-        """Read the IR here, on the control thread, then swap it in."""
+        """Read the IR and do all its maths here, on the control thread; the
+        audio thread only swaps a reference."""
         try:
-            import soundfile as sf
-            data, sr = sf.read(path, dtype="float64", always_2d=True)
-            ir = data[:, 0]
-            if abs(sr - self.samplerate) > 1:
-                from scipy.signal import resample_poly
-                from math import gcd
-                g = gcd(int(sr), int(self.samplerate))
-                ir = resample_poly(ir, int(self.samplerate) // g, int(sr) // g)
-            self.post(lambda: self.chain["ir"].set_ir(ir, path))
-            return ""
+            kernel = self._read_ir(path)
         except Exception as exc:  # noqa: BLE001
             return f"{type(exc).__name__}: {exc}"
+        self.post(lambda: self.chain["ir"].set_kernel(kernel, path))
+        return ""
 
     def clear_ir(self) -> None:
-        self.post(lambda: self.chain["ir"].set_ir(None, ""))
+        self.post(lambda: self.chain["ir"].set_kernel(None, ""))
+
+    def apply_preset(self, state: dict) -> str:
+        """Load a whole preset, including its IR file. Returns '' or an error.
+
+        The IR file is read here (file I/O is banned on the audio thread), then
+        the IR swap and every knob land together in one queued command, so the
+        new sound starts on a block boundary instead of in pieces. If the IR
+        file can't be read, the rest of the preset still loads, the IR block
+        is switched off, and the error comes back for the UI to show.
+        """
+        ir_state = state.get("ir") if isinstance(state, dict) else None
+        path = ir_state.get("ir_path", "") if isinstance(ir_state, dict) else ""
+        path = path if isinstance(path, str) else ""
+        blk = self.chain["ir"]
+        err = ""
+        kernel = None
+        keep = bool(path) and path == blk.ir_path and blk.has_ir
+        if path and not keep:
+            if not os.path.isfile(path):
+                err = f"IR file not found: {path}"
+            else:
+                try:
+                    kernel = self._read_ir(path)
+                except Exception as exc:  # noqa: BLE001
+                    err = f"Could not load IR {os.path.basename(path)}: " \
+                          f"{type(exc).__name__}: {exc}"
+
+        def swap():
+            if not keep:
+                blk.set_kernel(kernel, path if kernel is not None else "")
+            self.chain.apply(state)
+            if not blk.has_ir:
+                blk.enabled = False
+
+        self.post(swap)
+        return err
 
     # -- stream lifecycle --------------------------------------------------
 
@@ -483,6 +544,9 @@ class Engine:
                 s.close()
             except Exception:
                 pass
+        # Anything queued for a block that never came (a preset clicked just
+        # as the stream went down) still has to land.
+        self._drain_commands()
         if not gc.isenabled():
             gc.enable()
             gc.unfreeze()
@@ -497,6 +561,10 @@ class Engine:
             self.input_channel = 0
         sr = float(self.samplerate)
         n = int(self.active_blocksize)
+        # Was a clear() further down, which silently dropped preset and IR
+        # changes made while stopped. Run them instead (no stream yet, so no
+        # race), and before prepare() so it sizes whatever they swapped in.
+        self._drain_commands()
         self.chain.prepare(sr, n)
         self.looper.prepare(sr, n)
         self.recorder.prepare(sr)
@@ -510,7 +578,6 @@ class Engine:
         self.peak_load = 0.0
         self.channel_peaks[...] = 0.0
         self.n_input_channels = self._in_channels
-        self._commands.clear()
 
     # -- the callback ------------------------------------------------------
 

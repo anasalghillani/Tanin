@@ -1,7 +1,10 @@
 """Factory presets and preset file handling.
 
-A preset is a partial snapshot: anything it omits keeps the current value,
-which is what makes ``Chain.apply`` safe to call on a running stream.
+A preset describes a whole sound. It may leave blocks or parameters out, and
+``Chain.apply`` treats anything left out as that block's factory default (not
+"whatever the last preset set"), so a preset sounds the same whichever preset
+was loaded before it. Load presets with ``Engine.apply_preset`` so the IR file
+named in the preset is loaded too.
 """
 
 from __future__ import annotations
@@ -146,6 +149,52 @@ FACTORY: dict[str, dict] = {
 }
 
 
+MAX_NAME_LEN = 64
+
+# Names Windows reserves for devices, with or without an extension.
+_RESERVED = {"con", "prn", "aux", "nul",
+             *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+_BAD_CHARS = set('<>:"/\\|?*')
+
+
+def validate_name(name) -> str:
+    """'' if ``name`` is usable as a preset name, else why not (for the UI).
+
+    The name becomes a file name, so this refuses anything that could escape
+    the preset folder ('../x', 'a/b') or that Windows will not create
+    (reserved device names like CON, a trailing dot or space, : ? * etc.).
+    Any language is fine; the name is stored as UTF-8.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "Give the preset a name."
+    if name != name.strip():
+        return "The name can't start or end with a space."
+    if len(name) > MAX_NAME_LEN:
+        return f"Keep the name under {MAX_NAME_LEN} characters."
+    bad = sorted({ch for ch in name if ch in _BAD_CHARS or ord(ch) < 32})
+    if bad:
+        shown = " ".join(repr(ch)[1:-1] for ch in bad)
+        return f"The name can't contain {shown}"
+    if name.endswith("."):
+        return "The name can't end with a dot."
+    if name.split(".")[0].strip().lower() in _RESERVED:
+        return f"'{name}' is reserved by Windows; pick another name."
+    return ""
+
+
+def _path(directory: str, name: str) -> str:
+    err = validate_name(name)
+    if err:
+        raise ValueError(err)
+    return os.path.join(directory, f"{name}.json")
+
+
+def preset_exists(directory: str, name: str) -> bool:
+    """Whether saving under ``name`` would overwrite a preset (case-insensitive,
+    because Windows file names are)."""
+    return name.lower() in (n.lower() for n in list_presets(directory))
+
+
 def ensure_factory(directory: str) -> None:
     os.makedirs(directory, exist_ok=True)
     for name, state in FACTORY.items():
@@ -164,19 +213,27 @@ def list_presets(directory: str) -> list[str]:
 
 
 def load_preset(directory: str, name: str) -> dict:
-    with open(os.path.join(directory, f"{name}.json"), encoding="utf-8") as fh:
-        return json.load(fh)
+    with open(_path(directory, name), encoding="utf-8") as fh:
+        state = json.load(fh)
+    if not isinstance(state, dict):
+        raise ValueError("preset file is not a preset")
+    return state
 
 
 def save_preset(directory: str, name: str, state: dict) -> str:
+    """Raises ValueError for a bad name (see ``validate_name``)."""
+    path = _path(directory, name)
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2)
+    # Write to a temp file and swap it in, so a crash or full disk mid-write
+    # leaves the old preset intact instead of a half-written one.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
     return path
 
 
 def delete_preset(directory: str, name: str) -> None:
-    path = os.path.join(directory, f"{name}.json")
+    path = _path(directory, name)
     if os.path.exists(path):
         os.remove(path)

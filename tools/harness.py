@@ -558,6 +558,187 @@ def test_broadcast_drift():
           "; ".join(worst) if worst else "no underruns, fill stayed in band")
 
 
+# --------------------------------------------------------------------------
+# 12. Presets and the IR loader -- state that must survive the control path
+# --------------------------------------------------------------------------
+
+class _FakeStream:
+    """Stands in for a running sounddevice stream: Engine only stops it."""
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _write_wav(path: str, data: np.ndarray, sr: int = 48000) -> None:
+    import soundfile as sf
+    sf.write(path, data.astype(np.float32), sr)
+
+
+def test_presets_and_ir():
+    print("\n[12] presets and IR loader")
+    import tempfile
+
+    from amprack import presets as presetlib
+    from amprack.engine import Engine
+
+    tmp = tempfile.mkdtemp(prefix="tanin-harness-")
+
+    # (a) a preset that leaves a block out must not inherit the last preset's
+    #     settings for it: loading B after A has to sound like loading B.
+    a = presetlib.FACTORY["Metal Chug"]      # gate on, drive on, Plate reverb
+    b = presetlib.FACTORY["Clean Chime"]     # says nothing about the gate
+    after_a = Chain()
+    after_a.apply(a)
+    after_a.apply(b)
+    fresh = Chain()
+    fresh.apply(b)
+    sa, sf_ = after_a.snapshot(), fresh.snapshot()
+    diff = [f"{k}.{nm}" for k in Chain.PARAM_SPEC for nm in Chain.PARAM_SPEC[k]
+            if sa[k][nm] != sf_[k][nm]]
+    check("preset B after preset A equals preset B alone", not diff,
+          "bleeds: " + ", ".join(diff[:6]) if diff else "no carry-over")
+
+    # (b) junk in a preset file must not reach the audio thread as junk.
+    c = Chain()
+    c.apply({"amp": {"gain": "loud", "master": float("nan")},
+             "reverb": {"enabled": "yes please"}, "gate": "not a dict"})
+    ok = isinstance(c["amp"].gain, float) and math.isfinite(c["amp"].master) \
+        and isinstance(c["reverb"].enabled, bool)
+    check("malformed preset values fall back to defaults", ok,
+          f"gain={c['amp'].gain!r} master={c['amp'].master!r} "
+          f"reverb.enabled={c['reverb'].enabled!r}")
+
+    # (c) a preset or IR change made while audio is stopped must stick.
+    e = Engine(os.path.join(tmp, "rec"))
+    e.post(lambda: e.chain.apply(presetlib.FACTORY["Ambient Wash"]))
+    check("preset picked while stopped is applied",
+          e.chain["reverb"].mode == "Cathedral",
+          f"reverb mode {e.chain['reverb'].mode!r}")
+    #     ...and one queued just before the stream stops is not dropped.
+    e.running, e.stream = True, _FakeStream()
+    e.post(lambda: e.chain.apply(presetlib.FACTORY["Surf Twang"]))
+    e.stop()
+    check("command queued as the stream stops still lands",
+          e.chain["mod"].mode == "Tremolo" and not e._commands,
+          f"mod mode {e.chain['mod'].mode!r}, {len(e._commands)} left queued")
+
+    # (d) presets carry their IR file: loading one loads the IR, loading one
+    #     without an IR clears it.
+    rng = np.random.default_rng(3)
+    ir_a = np.exp(-np.arange(1500) / 300.0) * rng.standard_normal(1500)
+    ir_b = np.zeros(64)
+    ir_b[0] = 1.0
+    path_a = os.path.join(tmp, "cab_a.wav")
+    path_b = os.path.join(tmp, "cab_b.wav")
+    _write_wav(path_a, ir_a)
+    _write_wav(path_b, ir_b)
+
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    st = Chain().snapshot()
+    st["ir"].update(enabled=True, ir_path=path_a)
+    err = e.apply_preset(st)
+    irb = e.chain["ir"]
+    check("preset with an IR file loads that IR",
+          not err and irb.enabled and irb.ir_path == path_a and irb.has_ir,
+          err or f"enabled={irb.enabled} path={os.path.basename(irb.ir_path)!r}")
+    err = e.apply_preset(presetlib.FACTORY["Clean Chime"])
+    check("preset without an IR clears the previous one",
+          not err and not irb.enabled and irb.ir_path == "" and not irb.has_ir,
+          f"enabled={irb.enabled} path={irb.ir_path!r}")
+    st["ir"]["ir_path"] = os.path.join(tmp, "missing.wav")
+    err = e.apply_preset(st)
+    check("missing IR file is reported, not silently half-loaded",
+          bool(err) and not irb.enabled and e.chain["amp"].model == st["amp"]["model"],
+          err or "no error returned")
+
+    # (e) the IR maths runs on the control thread. Only a reference swap may
+    #     reach the audio thread's command queue.
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    e.running, e.stream = True, _FakeStream()     # pretend a stream is up
+    calls = {"n": 0}
+    real_rfft = np.fft.rfft
+
+    def counting_rfft(*args, **kw):
+        calls["n"] += 1
+        return real_rfft(*args, **kw)
+
+    err = e.load_ir(path_a)
+    np.fft.rfft = counting_rfft
+    try:
+        while e._commands:
+            e._commands.popleft()()
+    finally:
+        np.fft.rfft = real_rfft
+    e.running, e.stream = False, None
+    check("IR load does no FFT on the audio thread",
+          not err and calls["n"] == 0 and e.chain["ir"].has_ir,
+          err or f"{calls['n']} rfft call(s) in the drained command")
+
+    # (f) level: two very different IRs land at a similar loudness, and
+    #     neither a trim move nor an IR swap steps the output.
+    def ir_rms(path):
+        en = Engine(os.path.join(tmp, "rec"))
+        en.chain.prepare(SR, 256)
+        en.load_ir(path)
+        blk = en.chain["ir"]
+        noise = np.random.default_rng(5).standard_normal(int(SR)) * 0.1
+        out = np.concatenate([blk.process(noise[i:i + 256].copy())
+                              for i in range(0, len(noise) - 255, 256)])
+        return float(np.sqrt(np.mean(out[int(SR * 0.2):] ** 2)))
+
+    ra, rb = ir_rms(path_a), ir_rms(path_b)
+    gap = abs(20 * math.log10(ra / rb))
+    check("different IRs load at a matched level", gap < 1.5,
+          f"level gap {gap:.1f} dB")
+
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    e.load_ir(path_b)
+    blk = e.chain["ir"]
+    x = sine(220.0, 1.5, 0.3)
+    out = np.zeros(len(x))
+    for k, i in enumerate(range(0, len(x) - 255, 256)):
+        if k == 60:
+            blk.gain_db = 12.0                   # trim jumps 12 dB in one go
+        if k == 120:
+            e.load_ir(path_a)                    # swap the cab mid-note
+        out[i:i + 256] = blk.process(x[i:i + 256].copy())
+    n = (len(x) // 256) * 256
+    step = _max_step(out[:n])
+    # The yardstick is the sine's own slope in the loudest steady stretch on
+    # either side of the swap; a click is a step well above that.
+    natural = max(_max_step(out[70 * 256:118 * 256]), _max_step(out[130 * 256:n]))
+    check("IR trim move and IR swap do not click",
+          np.all(np.isfinite(out)) and step <= natural * 1.25,
+          f"max sample step {step:.4f} vs steady {natural:.4f}")
+
+    # (g) preset names end up as file names: refuse anything that could
+    #     escape the folder or that Windows will not create.
+    bad = ["", "   ", "../evil", "a/b", "a\\b", "CON", "nul", "com1.json",
+           "x:y", "what?", "name.", "tab\there", "x" * 100]
+    good = ["Clean Chime", "Lead #2", "طنين نظيف", "Ambient (wet)"]
+    slipped = [repr(nm) for nm in bad if not presetlib.validate_name(nm)]
+    refused = [repr(nm) for nm in good if presetlib.validate_name(nm)]
+    check("unsafe preset names are refused, normal ones accepted",
+          not slipped and not refused,
+          f"accepted {slipped} refused {refused}" if slipped or refused
+          else f"{len(bad)} refused, {len(good)} accepted")
+    pdir = os.path.join(tmp, "presets")
+    try:
+        presetlib.save_preset(pdir, "../escaped", {"amp": {}})
+        raised = False
+    except ValueError:
+        raised = True
+    check("save_preset will not write outside the preset folder",
+          raised and not os.path.exists(os.path.join(tmp, "escaped.json")),
+          "raised ValueError" if raised else "wrote it")
+
+
 def main():
     print("=" * 68)
     print("Tanin offline harness")
@@ -574,6 +755,7 @@ def main():
     test_aliasing()
     test_cpu_budget()
     test_broadcast_drift()
+    test_presets_and_ir()
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)

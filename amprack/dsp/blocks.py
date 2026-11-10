@@ -511,15 +511,48 @@ class Cabinet(Block):
         return self._prox.process(self._tilt.process(sig))
 
 
+class IRKernel:
+    """A ready-to-run impulse response: everything the audio thread needs,
+    already computed and allocated.
+
+    Built by ``IRLoader.build_kernel`` on the control thread. Handing one to
+    ``IRLoader.set_kernel`` is a reference swap, so loading a cab never puts an
+    FFT or an allocation on the audio thread.
+    """
+
+    __slots__ = ("ir", "h_fft", "fft_size", "hist", "max_block")
+
+    def __init__(self, ir: np.ndarray, max_block: int):
+        self.ir = ir
+        self.max_block = int(max_block)
+        size = 1
+        while size < self.max_block + len(ir):
+            size <<= 1
+        self.fft_size = size
+        self.h_fft = np.fft.rfft(ir, size)
+        self.hist = np.zeros(size, dtype=np.float64)
+
+
 class IRLoader(Block):
     """Overlap-save FFT convolution with a user-supplied impulse response.
 
-    The IR is swapped in by the engine's command queue, never here, because
-    changing it reallocates. Latency added is zero: overlap-save keeps the
-    output aligned with the input.
+    The IR is built into an ``IRKernel`` on the control thread and swapped in
+    through the engine's command queue. Latency added is zero: overlap-save
+    keeps the output aligned with the input.
+
+    Level is handled in three places so nothing jumps:
+
+    *   every IR is normalised to the same energy, so swapping cabs does not
+        swap loudness with it (peak normalising let a long, roomy IR come out
+        many dB hotter than a tight one);
+    *   trim and mix are smoothed per sample;
+    *   an IR swap crossfades from the old cab to the new one over one block.
     """
 
     name = "ir"
+
+    MAX_TAPS = 4096          # ~85 ms at 48k: longer than any guitar cab IR needs
+    TARGET_NORM = 1.0        # L2 norm: broadband signals pass at unity power
 
     def __init__(self):
         super().__init__()
@@ -527,61 +560,121 @@ class IRLoader(Block):
         self.mix = 1.0
         self.gain_db = 0.0
         self.ir_path = ""
-        self._h_fft = None
-        self._fft_size = 0
-        self._overlap = None
-        self._ir_len = 0
+        self._kernel: IRKernel | None = None
+        self._fade_from: IRKernel | None = None
+        self._fading = False
+        self._gain = SmoothedParam(1.0)
+        self._mix = SmoothedParam(1.0)
+        self._idx = np.zeros(0)
+        self._fade = np.zeros(0)
+        self._tmp = np.zeros(0)
+
+    @property
+    def has_ir(self) -> bool:
+        return self._kernel is not None
+
+    # -- control thread ----------------------------------------------------
+
+    @classmethod
+    def normalise(cls, ir: np.ndarray) -> np.ndarray:
+        ir = np.asarray(ir, dtype=np.float64).ravel()[: cls.MAX_TAPS]
+        if ir.size == 0 or not np.all(np.isfinite(ir)):
+            raise ValueError("impulse response is empty or not finite")
+        norm = float(np.sqrt(np.sum(ir * ir)))
+        if norm <= 1e-12:
+            raise ValueError("impulse response is silent")
+        return ir * (cls.TARGET_NORM / norm)
+
+    def build_kernel(self, ir: np.ndarray) -> IRKernel:
+        """All the expensive work of loading an IR. Call off the audio thread."""
+        return IRKernel(self.normalise(ir), self.max_block)
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._rebuild()
+        self._gain.prepare(max_block)
+        self._mix.prepare(max_block)
+        self._gain.snap(db2lin(self.gain_db))
+        self._mix.snap(clampf(self.mix, 0.0, 1.0))
+        self._idx = np.arange(1, max_block + 1, dtype=np.float64)
+        self._fade = np.zeros(max_block, dtype=np.float64)
+        self._tmp = np.zeros(max_block, dtype=np.float64)
+        # A new block size needs a new FFT size; prepare() is control-thread.
+        if self._kernel is not None and self._kernel.max_block != self.max_block:
+            self._kernel = IRKernel(self._kernel.ir, self.max_block)
+        self._fade_from = None
+        self._fading = False
+
+    # -- audio thread (command drain) --------------------------------------
+
+    def set_kernel(self, kernel: IRKernel | None, path: str = "") -> None:
+        """Swap the IR in, or out with None. Reference assignments only."""
+        old = self._kernel
+        if kernel is not None and kernel.max_block < self.max_block:
+            # Built for a smaller block than we now run: unusable here, and
+            # rebuilding would mean an FFT on the audio thread. Drop it.
+            return
+        if kernel is not None and old is not None:
+            # Carry the input history across so the new cab starts "warm"
+            # instead of convolving from silence.
+            k = min(len(old.hist), len(kernel.hist))
+            kernel.hist[-k:] = old.hist[-k:]
+        self._kernel = kernel
+        self.ir_path = path if kernel is not None else ""
+        if old is not None and self.enabled:
+            self._fade_from = old
+            self._fading = True
+        if kernel is None and old is None:
+            self.enabled = False
+        elif kernel is not None:
+            self.enabled = True
 
     def set_ir(self, ir: np.ndarray | None, path: str = "") -> None:
-        """Called from the engine command drain, i.e. still on the audio
-        thread but before processing -- so keep it to one allocation and
-        accept it. Called with None to clear."""
-        self.ir_path = path
-        if ir is None or ir.size == 0:
-            self._h_fft = None
-            self.enabled = False
-            return
-        ir = np.asarray(ir, dtype=np.float64).ravel()
-        # 4096 taps is ~85 ms at 48k -- longer than any guitar cab IR needs.
-        ir = ir[:4096]
-        peak = float(np.max(np.abs(ir)))
-        if peak > 0:
-            ir = ir / peak * 0.5
-        self._ir = ir
-        self._rebuild()
-
-    def _rebuild(self):
-        ir = getattr(self, "_ir", None)
-        if ir is None:
-            self._h_fft = None
-            return
-        self._ir_len = len(ir)
-        size = 1
-        while size < self.max_block + self._ir_len:
-            size <<= 1
-        self._fft_size = size
-        self._h_fft = np.fft.rfft(ir, size)
-        self._hist = np.zeros(size, dtype=np.float64)
+        """Convenience for offline use (tests, scripts). Builds the kernel
+        right here, so do not call it from the audio callback."""
+        self.set_kernel(None if ir is None or np.size(ir) == 0
+                        else self.build_kernel(ir), path)
 
     def reset(self):
-        if self._h_fft is not None:
-            self._hist[...] = 0.0
+        for k in (self._kernel, self._fade_from):
+            if k is not None:
+                k.hist[...] = 0.0
+
+    def _convolve(self, k: IRKernel, x: np.ndarray, n: int) -> np.ndarray:
+        # Overlap-save: keep the previous (fft_size - n) input samples.
+        h = k.hist
+        h[:-n] = h[n:]
+        h[-n:] = x
+        return np.fft.irfft(np.fft.rfft(h) * k.h_fft, k.fft_size)[-n:]
 
     def _process(self, x, n):
-        if self._h_fft is None:
+        k = self._kernel
+        old = self._fade_from if self._fading else None
+        if k is None and old is None:
+            if self.ir_path == "" and self.enabled:
+                # Cleared: the fade-out has finished, now really switch off.
+                self.enabled = False
             return x
-        # Overlap-save: keep the previous (fft_size - n) input samples.
-        self._hist[:-n] = self._hist[n:]
-        self._hist[-n:] = x
-        y = np.fft.irfft(np.fft.rfft(self._hist) * self._h_fft, self._fft_size)
-        wet = y[-n:] * db2lin(self.gain_db)
-        if self.mix >= 0.999:
+
+        wet = self._convolve(k, x, n) if k is not None else x.copy()
+        if old is not None:
+            # One-block linear crossfade from the previous IR (or to dry,
+            # when the IR was cleared).
+            prev = self._convolve(old, x, n)
+            fade = self._fade[:n]
+            np.divide(self._idx[:n], n, out=fade)
+            wet *= fade
+            np.subtract(1.0, fade, out=self._tmp[:n])
+            wet += prev * self._tmp[:n]
+            self._fading = False
+            self._fade_from = None
+
+        self._gain.set(db2lin(clampf(self.gain_db, -24.0, 24.0)))
+        wet *= self._gain.ramp(n)
+        self._mix.set(clampf(self.mix, 0.0, 1.0))
+        m = self._mix.ramp(n)
+        if np.isscalar(m) and m >= 0.999:
             return wet
-        return x * (1.0 - self.mix) + wet * self.mix
+        return x * (1.0 - m) + wet * m
 
 
 # ==========================================================================
