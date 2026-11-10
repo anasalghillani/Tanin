@@ -1005,14 +1005,14 @@ class Output(Block):
         self.peak_l = 0.0
         self.peak_r = 0.0
         self._g = SmoothedParam(db2lin(-6.0))
-        self._limiter_env = OnePole(30.0)
+        self._limiter_env = OnePole(60.0)
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
         self._g.prepare(max_block)
         self._g.snap(db2lin(self.volume_db))
         self._limiter_env.prepare(sr, 1)
-        self._limiter_env.reset()
+        self._limiter_env.reset(1.0)
 
     def _process(self, x, n):
         w = clampf(self.width, 0.0, 2.0)
@@ -1025,12 +1025,21 @@ class Output(Block):
 
         # Brick-wall safety limiter. Not a tone control -- it exists so a
         # runaway feedback loop cannot blow up headphones.
+        # Instant attack: the gain each sample needs is computed directly, so
+        # the very first loud sample is already held at the ceiling (the old
+        # 30 ms smoothed envelope let a sudden spike through at full level for
+        # tens of milliseconds). Release: that gain also goes through a 60 ms
+        # one-pole and we take the smaller of the two -- falling gain follows
+        # the instant one, rising gain follows the slow one. Same trick as the
+        # gate, and block-size invariant because the filter runs every block.
         peak = np.max(np.abs(y), axis=0)
-        env = self._limiter_env.process(peak)
-        over = env > 0.95
-        if np.any(over):
-            g = np.ones(n)
-            g[over] = 0.95 / env[over]
+        need = np.minimum(1.0, 0.95 / np.maximum(peak, 1e-12))
+        slow = self._limiter_env.process(need)
+        g = np.minimum(need, slow)
+        # Snap the last millionth of release to exactly 1 so a signal below the
+        # ceiling passes bit-for-bit untouched (a -120 dB step, inaudible).
+        g[g > 1.0 - 1e-6] = 1.0
+        if np.any(g < 1.0):
             y = y * g
 
         self.peak_l = float(np.max(np.abs(y[0]))) if n else 0.0
