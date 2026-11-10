@@ -112,16 +112,16 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         lay = QVBoxLayout(root)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(12)
 
         lay.addWidget(self._build_header())
 
         body = QHBoxLayout()
-        body.setSpacing(10)
+        body.setSpacing(12)
         body.addWidget(self._build_sidebar())
         right = QVBoxLayout()
-        right.setSpacing(10)
+        right.setSpacing(12)
         right.addWidget(self._build_chain())
         right.addWidget(self._build_focus(), 1)
         right.addWidget(self._build_dock())
@@ -144,17 +144,12 @@ class MainWindow(QMainWindow):
     def _build_header(self) -> QFrame:
         bar = _card()
         h = QHBoxLayout(bar)
-        h.setContentsMargins(14, 8, 10, 8)
+        h.setContentsMargins(18, 10, 12, 10)
         h.setSpacing(8)
 
         title = QLabel("TANIN")
-        f = QFont(title.font())
-        f.setPointSizeF(13)
-        f.setBold(True)
-        f.setLetterSpacing(QFont.AbsoluteSpacing, 3.0)
-        title.setFont(f)
-        title.setStyleSheet(f"color:{theme.AMBER};")
-        title.setFixedWidth(196)
+        title.setObjectName("Brand")
+        title.setFixedWidth(206)
         h.addWidget(title)
 
         prev_b = QPushButton("‹")
@@ -211,11 +206,13 @@ class MainWindow(QMainWindow):
         h.addWidget(self.btn_bypass)
 
         panic = QPushButton("Panic")
+        panic.setObjectName("Ghost")
         panic.setToolTip("Silence every delay and reverb tail immediately")
         panic.clicked.connect(self.engine.panic)
         h.addWidget(panic)
 
         gear = QPushButton("⚙  Settings")
+        gear.setObjectName("Ghost")
         gear.setToolTip("Audio device, buffer size and Stream Out")
         gear.clicked.connect(self._show_settings)
         h.addWidget(gear)
@@ -229,7 +226,7 @@ class MainWindow(QMainWindow):
         bar = _card()
         bar.setFixedWidth(220)
         v = QVBoxLayout(bar)
-        v.setContentsMargins(10, 12, 10, 10)
+        v.setContentsMargins(12, 16, 12, 12)
         v.setSpacing(8)
         v.addWidget(_section("PRESETS"))
 
@@ -243,12 +240,14 @@ class MainWindow(QMainWindow):
         save = QPushButton("Save")
         save.setToolTip("Overwrite the selected preset with the current sound")
         save.clicked.connect(self._save_preset)
+        save.setObjectName("Primary")
         save_as = QPushButton("Save as…")
         save_as.clicked.connect(self._save_preset_as)
         row.addWidget(save, 1)
         row.addWidget(save_as, 1)
         v.addLayout(row)
         delete = QPushButton("Delete")
+        delete.setObjectName("Ghost")
         delete.clicked.connect(self._delete_preset)
         v.addWidget(delete)
 
@@ -265,7 +264,7 @@ class MainWindow(QMainWindow):
         bar = _card()
         h = QHBoxLayout(bar)
         h.setContentsMargins(10, 10, 10, 10)
-        h.setSpacing(4)
+        h.setSpacing(2)
 
         for n, key in enumerate(ORDER):
             if n:
@@ -301,8 +300,8 @@ class MainWindow(QMainWindow):
             t = name.text() if name is not None else ""
             return t if t and not t.startswith("no ") else "no file"
         if key in ("gate", "comp"):
-            return "on"
-        return str(getattr(b, "model", None) or getattr(b, "mode", "") or "on")
+            return "On"
+        return str(getattr(b, "model", None) or getattr(b, "mode", "") or "On")
 
     def _refresh_tiles(self) -> None:
         for key, tile in self.tiles.items():
@@ -334,8 +333,8 @@ class MainWindow(QMainWindow):
     def _build_focus(self) -> QFrame:
         frame = _card("Focus")
         h = QHBoxLayout(frame)
-        h.setContentsMargins(12, 12, 12, 10)
-        h.setSpacing(14)
+        h.setContentsMargins(18, 18, 18, 14)
+        h.setSpacing(18)
 
         # Input column
         self.ch_combo.setFixedWidth(76)
@@ -389,10 +388,10 @@ class MainWindow(QMainWindow):
 
     def _build_dock(self) -> QTabWidget:
         self.dock = QTabWidget()
-        self.dock.setFixedHeight(146)
-        self.dock.addTab(self._build_looper(), "LOOPER")
-        self.dock.addTab(self._build_recorder(), "RECORDER")
-        self.dock.addTab(self._build_click(), "CLICK")
+        self.dock.setFixedHeight(164)
+        self.dock.addTab(self._build_looper(), "Looper")
+        self.dock.addTab(self._build_recorder(), "Recorder")
+        self.dock.addTab(self._build_click(), "Click")
         return self.dock
 
     def _build_looper(self) -> QWidget:
@@ -405,7 +404,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(6)
         self.btn_loop = QPushButton("● REC")
-        self.btn_loop.setObjectName("Danger")
+        self.btn_loop.setObjectName("Primary")
         self.btn_loop.setMinimumWidth(110)
         self.btn_loop.setToolTip("Record, then play, then overdub (Space)")
         self.btn_loop.clicked.connect(self._loop_toggle)
@@ -1166,7 +1165,7 @@ class MainWindow(QMainWindow):
         self.status_pill.setText(text)
         self.status_pill.setStyleSheet(f"color:{col};")
         self.bcast_chip.setVisible(e.broadcast.running)
-        rec_tab = "RECORDER  ●" if e.recorder.recording else "RECORDER"
+        rec_tab = "Recorder  ●" if e.recorder.recording else "Recorder"
         if self.dock.tabText(1) != rec_tab:
             self.dock.setTabText(1, rec_tab)
 

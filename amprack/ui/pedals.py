@@ -80,23 +80,24 @@ class PedalCard(QFrame):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 9, 12, 11)
-        root.setSpacing(8)
+        root.setSpacing(10)
 
         # -- header
         head = QHBoxLayout()
         head.setSpacing(8)
         if always_on:
             self.led = None
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color:{self.accent}; font-size:13px;")
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            dot.setStyleSheet(f"background:{self.accent}; border-radius:5px;")
             head.addWidget(dot)
         else:
-            self.led = PowerLED(self.accent, 18)
+            self.led = PowerLED(self.accent, 22)
             self.led.setChecked(bool(self.block.enabled), emit=False)
             self.led.toggled.connect(self._on_power)
             self.led.setToolTip("Enable / bypass this module")
             head.addWidget(self.led)
-        name = QLabel(title)
+        name = QLabel(title.title() if title.isupper() and len(title) > 3 else title)
         name.setObjectName("CardTitle")
         head.addWidget(name)
         head.addStretch(1)
