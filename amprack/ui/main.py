@@ -1047,6 +1047,8 @@ def run() -> int:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setApplicationName("Tanin")
+    from .. import brand
+    brand.apply(app)  # window + taskbar icon
     app.setStyleSheet(theme.QSS)
     win = MainWindow()
     win.show()
