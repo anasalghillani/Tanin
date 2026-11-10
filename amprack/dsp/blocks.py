@@ -309,7 +309,7 @@ class AmpModel:
 
     def __init__(self, name, stages, stage_gain, bias, input_hp, coupling_lp,
                  tone_bass, tone_mid, tone_mid_q, tone_treble, out_lp, gain_range,
-                 shaper="tube"):
+                 shaper="tube", stage_hp=30.0, stage_lp_ratio=1.5):
         self.name = name
         self.stages = stages
         self.stage_gain = stage_gain
@@ -323,25 +323,33 @@ class AmpModel:
         self.out_lp = out_lp
         self.gain_range = gain_range
         self.shaper = shaper
+        # Inter-stage voicing (see Amp.interstage): the coupling-cap highpass
+        # and Miller-capacitance lowpass between gain stages.
+        self.stage_hp = stage_hp
+        self.stage_lp = coupling_lp * stage_lp_ratio
 
 
 AMP_MODELS = {
     "Clean": AmpModel(
         "Clean", stages=2, stage_gain=0.65, bias=0.06, input_hp=45.0,
         coupling_lp=12000.0, tone_bass=95.0, tone_mid=500.0, tone_mid_q=0.6,
-        tone_treble=3200.0, out_lp=9000.0, gain_range=(0.8, 14.0)),
+        tone_treble=3200.0, out_lp=9000.0, gain_range=(0.8, 14.0),
+        stage_hp=20.0),
     "Crunch": AmpModel(
         "Crunch", stages=3, stage_gain=0.8, bias=0.10, input_hp=70.0,
         coupling_lp=9000.0, tone_bass=110.0, tone_mid=650.0, tone_mid_q=0.7,
-        tone_treble=2800.0, out_lp=7000.0, gain_range=(1.5, 60.0)),
+        tone_treble=2800.0, out_lp=7000.0, gain_range=(1.5, 60.0),
+        stage_hp=35.0),
     "Lead": AmpModel(
         "Lead", stages=4, stage_gain=0.95, bias=0.13, input_hp=90.0,
         coupling_lp=7000.0, tone_bass=120.0, tone_mid=750.0, tone_mid_q=0.8,
-        tone_treble=2600.0, out_lp=6200.0, gain_range=(3.0, 220.0)),
+        tone_treble=2600.0, out_lp=6200.0, gain_range=(3.0, 220.0),
+        stage_hp=60.0),
     "Metal": AmpModel(
         "Metal", stages=4, stage_gain=1.05, bias=0.08, input_hp=115.0,
         coupling_lp=6000.0, tone_bass=130.0, tone_mid=800.0, tone_mid_q=1.0,
-        tone_treble=3000.0, out_lp=5600.0, gain_range=(6.0, 600.0)),
+        tone_treble=3000.0, out_lp=5600.0, gain_range=(6.0, 600.0),
+        stage_hp=90.0),
 }
 
 
@@ -349,6 +357,15 @@ class Amp(Block):
     """Cascaded-gain-stage preamp, passive-style tone stack, power-amp sag."""
 
     name = "amp"
+
+    # Inter-stage coupling filters (audit item 12). In a real preamp every
+    # gain stage is followed by a coupling capacitor (a highpass: keeps low
+    # end from piling up and farting out the next stage) and the valve's
+    # Miller capacitance (a lowpass: takes the fizz off before it is clipped
+    # again). They were allocated but never run. True = on, the new voicing;
+    # False = the previous sound, kept so the two can be A/B'd -- see
+    # tools/ab_amp.py. Class-level so flipping Amp.interstage switches all.
+    interstage = True
 
     def __init__(self):
         super().__init__()
@@ -381,10 +398,11 @@ class Amp(Block):
         for f in (self._in_hp, self._bass, self._mid, self._treble,
                   self._presence, self._out_lp):
             f.prepare(sr, 1)
-        for f in self._couple:
-            f.prepare(sr, 1)
-        for f in self._stage_hp:
-            f.prepare(sr, 1)
+        # _couple[0] is the post-preamp lowpass at the base rate; the rest,
+        # and the stage highpasses, live inside the oversampled loop.
+        self._couple[0].prepare(sr, 1)
+        for f in self._couple[1:] + self._stage_hp:
+            f.prepare(sr * self._os.factor, 1)
         self._dc.prepare(sr, 1)
         self._os.prepare(sr, max_block)
         self._sag_env.prepare(sr, 1)
@@ -424,12 +442,18 @@ class Amp(Block):
             sag_gain = 1.0
 
         up = self._os.up(sig)
-        # Coupling filters run at base rate, so the per-stage lowpass is applied
-        # after downsampling in a single pass; inside the oversampled loop we
-        # only shape, which is where the aliasing would come from.
+        inter = self.interstage
         for i in range(m.stages):
             up = shaper(up, per_stage, m.bias * (1.0 if i % 2 == 0 else -0.6))
             up *= 0.85  # inter-stage attenuation, keeps later stages in range
+            if inter and i < m.stages - 1:
+                # Between stages, at the oversampled rate so the lowpass acts
+                # on the harmonics the previous stage just made.
+                hp = self._stage_hp[i]
+                hp.set(f0=m.stage_hp)
+                lp = self._couple[i + 1]
+                lp.set(f0=m.stage_lp)
+                up = lp.process(hp.process(up))
         sig = self._os.down(up)
         sig = self._dc.process(sig)
 
