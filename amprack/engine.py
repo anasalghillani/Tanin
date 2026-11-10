@@ -288,6 +288,22 @@ class Engine:
         self.exclusive_fallback = False
         self.channel_peaks = np.zeros(16, dtype=np.float64)
         self.n_input_channels = 1
+        # Meters: the callback runs ~190x/s, the UI ~30x/s, so peaks are
+        # accumulated per block and handed over on request (see read_meters).
+        self.out_peaks = np.zeros(2, dtype=np.float64)
+        self.in_clips = 0             # blocks where the guitar input hit full scale
+        self.out_clips = 0            # blocks the final hard clip had to cut
+        self.output_muted = False     # tuner mute: silence out, keep metering
+        self._meter_take = False
+        self._in_acc = np.zeros(16, dtype=np.float32)
+        self._in_blk = np.zeros(16, dtype=np.float32)
+        self._out_acc = np.zeros(2, dtype=np.float64)
+        self._out_blk = np.zeros(2, dtype=np.float64)
+        self._abs_in = np.zeros((0, 8), dtype=np.float32)
+        self._abs_out = np.zeros((2, 0), dtype=np.float64)
+        self._mute_gain = 1.0
+        self._ramp = np.zeros(0, dtype=np.float64)
+        self._gain_buf = np.zeros(0, dtype=np.float64)
 
         self.stream: sd.Stream | None = None
         self.running = False
@@ -492,7 +508,10 @@ class Engine:
 
     def _prepare(self) -> None:
         dev = sd.query_devices(self.input_device)
-        self._in_channels = max(1, min(int(dev["max_input_channels"]), 8))
+        self._prepare_buffers(int(dev["max_input_channels"]))
+
+    def _prepare_buffers(self, max_in_channels: int) -> None:
+        self._in_channels = max(1, min(int(max_in_channels), 8))
         if self.input_channel >= self._in_channels:
             self.input_channel = 0
         sr = float(self.samplerate)
@@ -509,6 +528,14 @@ class Engine:
         self.blocks_processed = 0
         self.peak_load = 0.0
         self.channel_peaks[...] = 0.0
+        self.out_peaks[...] = 0.0
+        self._in_acc[...] = 0.0
+        self._out_acc[...] = 0.0
+        self._abs_in = np.zeros((n, 8), dtype=np.float32)
+        self._abs_out = np.zeros((2, n), dtype=np.float64)
+        self._ramp = np.arange(1, n + 1, dtype=np.float64) / n
+        self._gain_buf = np.zeros(n, dtype=np.float64)
+        self._mute_gain = 0.0 if self.output_muted else 1.0
         self.n_input_channels = self._in_channels
         self._commands.clear()
 
@@ -539,16 +566,23 @@ class Engine:
                 outdata[:] = 0.0
                 return
 
-            nch = indata.shape[1]
+            nch = min(indata.shape[1], 8)
             # Meter every hardware input, not just the selected one. Picking
             # the right jack is guesswork otherwise -- the channel that moves
-            # when you play is the answer.
-            self.channel_peaks[:nch] = np.max(np.abs(indata), axis=0)
+            # when you play is the answer. Peaks accumulate across blocks
+            # into preallocated arrays: no allocation, no lock.
+            a = self._abs_in[:n, :nch]
+            np.abs(indata[:, :nch], out=a)
+            blk = self._in_blk[:nch]
+            np.max(a, axis=0, out=blk)
+            np.maximum(self._in_acc[:nch], blk, out=self._in_acc[:nch])
             self.n_input_channels = nch
 
             ch = self.input_channel
             if ch >= nch:
                 ch = 0
+            if blk[ch] >= 0.999:
+                self.in_clips += 1
             mono = indata[:, ch].astype(np.float64)
             self.input_ring.push(indata[:, ch], n)
 
@@ -560,14 +594,26 @@ class Engine:
 
             wet = self.looper.process(wet, n)
             self.metronome.render(wet, n)
+            # Tuner mute goes before the recorder and Stream Out, so nobody
+            # (you, the take, or Discord) hears the tuning.
+            if self.output_muted or self._mute_gain < 1.0:
+                self._apply_mute(wet, n)
             self.recorder.push(wet, mono, n)
             self.broadcast.push(wet, n)
 
             np.nan_to_num(wet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            # Measure before the hard clip, or clipping could never show.
+            ao = self._abs_out[:, :n]
+            np.abs(wet, out=ao)
+            np.max(ao, axis=1, out=self._out_blk)
+            np.maximum(self._out_acc, self._out_blk, out=self._out_acc)
+            if self._out_blk[0] > 1.0 or self._out_blk[1] > 1.0:
+                self.out_clips += 1
             np.clip(wet, -1.0, 1.0, out=wet)
             outdata[:, 0] = wet[0]
             outdata[:, 1] = wet[1]
             self.blocks_processed += 1
+            self._publish_meters()
 
         except Exception as exc:  # noqa: BLE001
             # Nothing here may propagate: PortAudio would abort the stream and
@@ -582,6 +628,40 @@ class Engine:
                 self.peak_load = self.load
 
     # -- helpers for the UI ------------------------------------------------
+
+    def _apply_mute(self, wet: np.ndarray, n: int) -> None:
+        """Tuner mute with a one-block ramp so it never clicks."""
+        target = 0.0 if self.output_muted else 1.0
+        g0 = self._mute_gain
+        if g0 == target:
+            if target == 0.0:
+                wet[...] = 0.0
+            return
+        g = self._gain_buf[:n]
+        np.multiply(self._ramp[:n], target - g0, out=g)
+        g += g0
+        wet *= g
+        self._mute_gain = target
+
+    def _publish_meters(self) -> None:
+        """Callback side of read_meters(): hand over and restart the peaks."""
+        if self._meter_take:
+            self.channel_peaks[:8] = self._in_acc[:8]
+            self.out_peaks[:] = self._out_acc
+            self._in_acc[...] = 0.0
+            self._out_acc[...] = 0.0
+            self._meter_take = False
+
+    def read_meters(self) -> tuple[np.ndarray, np.ndarray]:
+        """UI side: peaks gathered since the previous read, per channel.
+
+        The callback is the only writer of the peak arrays. This just raises
+        a flag; the callback copies its running maximum out and restarts it
+        at the end of its next block. Every block lands in exactly one read,
+        and neither side ever waits for the other.
+        """
+        self._meter_take = True
+        return self.channel_peaks, self.out_peaks
 
     def reset_meters(self) -> None:
         self.peak_load = 0.0

@@ -299,13 +299,30 @@ class LevelMeter(QWidget):
     6 dB and tells you nothing about where you actually are.
     """
 
-    def __init__(self, channels: int = 2, horizontal: bool = True, parent=None):
+    CLIP_PAD = 11   # room for the clip light above (or right of) the bars
+
+    def __init__(self, channels: int = 2, horizontal: bool = True, parent=None,
+                 clip_light: bool = False):
         super().__init__(parent)
         self.horizontal = horizontal
         self.labels: list[str] = []
         self.highlight = -1     # index drawn in the accent colour
         self.channels = 0
+        self.clip_light = clip_light
+        self.clipped = False    # latched until clicked
         self.setChannelCount(channels)
+
+    def setClipped(self, on: bool) -> None:
+        if on != self.clipped:
+            self.clipped = on
+            self.update()
+
+    def mousePressEvent(self, e):
+        # Clip light latches so a split-second overload is never missed;
+        # clicking anywhere on the meter clears it.
+        if self.clip_light and self.clipped:
+            self.setClipped(False)
+        super().mousePressEvent(e)
 
     def setChannelCount(self, channels: int) -> None:
         channels = max(1, int(channels))
@@ -320,7 +337,7 @@ class LevelMeter(QWidget):
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.setFixedHeight(8 * channels + 2)
         else:
-            self.setFixedWidth(12 * channels + 2)
+            self.setFixedWidth(max(12 * channels + 2, 22 if self.clip_light else 0))
             self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.updateGeometry()
 
@@ -355,11 +372,21 @@ class LevelMeter(QWidget):
         n = self.channels
         pad = 14 if (self.labels and self.horizontal) else 0
         vpad = 14 if (self.labels and not self.horizontal) else 0
+        cpad = self.CLIP_PAD if self.clip_light else 0
+        if cpad:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            if self.horizontal:
+                led = QRectF(w - cpad + 3, 1, cpad - 3, h - 2)
+            else:
+                led = QRectF(2, 0, max(8, n * 12 - 4), cpad - 4)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_c(theme.RED) if self.clipped else _c(theme.WELL))
+            p.drawRoundedRect(led, 2, 2)
         for i in range(n):
             if self.horizontal:
-                bar = QRectF(pad, i * 8 + 1, w - pad, 6)
+                bar = QRectF(pad, i * 8 + 1, w - pad - cpad, 6)
             else:
-                bar = QRectF(i * 12 + 2, 0, 8, h - vpad)
+                bar = QRectF(i * 12 + 2, cpad, 8, h - vpad - cpad)
             p.setRenderHint(QPainter.Antialiasing, True)
             well = QPainterPath()
             well.addRoundedRect(bar, 3, 3)

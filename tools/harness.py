@@ -558,6 +558,88 @@ def test_broadcast_drift():
           "; ".join(worst) if worst else "no underruns, fill stayed in band")
 
 
+def test_meters_and_mute():
+    """Meters must show every peak, not just the block the UI happened to see.
+
+    The UI redraws ~30 times a second; at a 256-sample buffer the callback
+    runs ~190 times a second, so a meter that shows only the latest block
+    misses five blocks in six.
+    """
+    print("\n[meters] peak capture, clip lights, tuner mute")
+    import tempfile
+    from amprack.engine import Engine
+
+    n = 256
+    e = Engine(tempfile.mkdtemp())
+    e.samplerate = 48000
+    e.active_blocksize = n
+    e._prepare_buffers(2)
+    out = np.zeros((n, 2), dtype=np.float32)
+
+    def block(a0=0.01, a1=0.01, spike0=0.0):
+        x = np.zeros((n, 2), dtype=np.float32)
+        x[:, 0] = a0 * np.sin(np.arange(n) * 0.05)
+        x[:, 1] = a1 * np.sin(np.arange(n) * 0.07)
+        if spike0:
+            x[n // 3, 0] = spike0
+        e._callback(x, out, n, None, None)
+
+    # One spike in the middle of many blocks between two UI reads.
+    for i in range(40):
+        block(spike0=0.9 if i == 20 else 0.0)
+    e.read_meters()
+    block()                      # the callback publishes on its next block
+    pk_in, _ = e.read_meters()
+    check("input meter catches a single-block peak between UI reads",
+          abs(float(pk_in[0]) - 0.9) < 1e-6, f"shown {float(pk_in[0]):.3f}, real 0.900")
+
+    # Reads interleaved with spikes: no spike may fall between the cracks.
+    spikes = [round(0.1 + 0.05 * k, 2) for k in range(16)]
+    seen = []
+    for i in range(160):
+        block(spike0=spikes[i // 10] if i % 10 == 4 else 0.0)
+        if i % 3 == 2:
+            seen.append(round(float(e.read_meters()[0][0]), 2))
+    block()
+    seen.append(round(float(e.read_meters()[0][0]), 2))
+    missed = [s for s in spikes if s not in seen]
+    check("no peak lost when the UI reads mid-stream", not missed,
+          f"missed {missed}" if missed else f"all {len(spikes)} spikes shown")
+
+    # Clip light: selected input hitting full scale; ch2 clipping is ignored.
+    c0 = e.in_clips
+    block(spike0=1.0)
+    block(a1=1.0)
+    check("input clip counted on the guitar channel only", e.in_clips - c0 == 1,
+          f"{e.in_clips - c0} clip events")
+
+    ch = e.chain
+    ch.global_bypass = True
+    ch.input_gain_db = 24.0
+    o0 = e.out_clips
+    for _ in range(8):
+        block(a0=0.5)
+    check("output clip detected before the final hard clip", e.out_clips > o0,
+          f"{e.out_clips - o0} clipped blocks")
+
+    # Tuner mute: silent output, tuner still hears the guitar.
+    ch.input_gain_db = 0.0
+    e.output_muted = True
+    for _ in range(4):
+        block(a0=0.5)
+    muted_out = float(np.max(np.abs(out)))
+    ring = float(np.max(np.abs(e.input_ring.snapshot(n))))
+    e.output_muted = False
+    for _ in range(4):
+        block(a0=0.5)
+    back = float(np.max(np.abs(out)))
+    check("tuner mute silences output but keeps feeding the tuner",
+          muted_out == 0.0 and ring > 0.4 and back > 0.4 and e.callback_errors == 0,
+          f"muted {muted_out:.4f}, tuner input {ring:.2f}, unmuted {back:.2f}, "
+          f"errors {e.callback_errors} {e.last_callback_exc}")
+    ch.global_bypass = False
+
+
 def main():
     print("=" * 68)
     print("Tanin offline harness")
@@ -574,6 +656,7 @@ def main():
     test_aliasing()
     test_cpu_budget()
     test_broadcast_drift()
+    test_meters_and_mute()
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)

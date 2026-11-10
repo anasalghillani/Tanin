@@ -104,6 +104,8 @@ class MainWindow(QMainWindow):
         self._selected = "amp"
         self._tuner_on = False
         self._tick = 0
+        self._seen_in_clips = 0
+        self._seen_out_clips = 0
 
         # The settings window owns the device widgets, and the rest of the
         # window reads them, so it is built first.
@@ -130,6 +132,7 @@ class MainWindow(QMainWindow):
 
         self._select_module(self._selected)
         self._install_shortcuts()
+        self.tuner_mute.setChecked(self._settings.get("tuner_mute", True))
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_tick)
@@ -346,11 +349,13 @@ class MainWindow(QMainWindow):
         # Input column
         self.ch_combo.setFixedWidth(76)
         self.ch_combo.setToolTip("Which jack on your interface the guitar is in")
-        self.in_meter = LevelMeter(2, horizontal=False)
+        self.in_meter = LevelMeter(2, horizontal=False, clip_light=True)
         self.in_meter.setToolTip(
             "Every hardware input on the interface. Play: whichever bar moves "
             "is your guitar; pick that one above. Aim for peaks around "
-            "-12 to -6 dBFS.")
+            "-12 to -6 dBFS. The light on top turns red if the guitar input "
+            "hits full scale (clips). Lower the gain on your interface, then "
+            "click the meter to clear it.")
         self.k_in = Knob("input", -24, 36, 0, " dB", 1, theme.GREEN, 1.0, 40)
         self.k_in.setToolTip("Input level. Turn up if the meter barely moves.")
         self.k_in.valueChanged.connect(
@@ -373,6 +378,13 @@ class MainWindow(QMainWindow):
         self.tuner = TunerDisplay()
         self.tuner.setMinimumHeight(180)
         tv.addWidget(self.tuner, 1)
+        self.tuner_mute = QCheckBox("Mute output while tuning")
+        self.tuner_mute.setChecked(True)
+        self.tuner_mute.setToolTip(
+            "Silences your speakers, recordings and Stream Out while the tuner "
+            "is open. The tuner still hears the guitar.")
+        self.tuner_mute.toggled.connect(self._apply_tuner_mute)
+        tv.addWidget(self.tuner_mute, 0, Qt.AlignHCenter)
         tv.addWidget(_hint("Press T or the Tuner button again to go back."))
         self.focus_stack.addWidget(tuner_page)
         self._tuner_page = tuner_page
@@ -382,8 +394,11 @@ class MainWindow(QMainWindow):
 
         # Output column
         outb = self.engine.chain["output"]
-        self.out_meter = LevelMeter(2, horizontal=False)
+        self.out_meter = LevelMeter(2, horizontal=False, clip_light=True)
         self.out_meter.labels = ["L", "R"]
+        self.out_meter.setToolTip(
+            "What you hear. The light on top turns red if the output clips; "
+            "turn the volume down, then click the meter to clear it.")
         self.k_out = Knob("volume", -40, 6, -6, " dB", 1, theme.AMBER, 1.0, 40)
         self.k_out.valueChanged.connect(lambda v: setattr(outb, "volume_db", v))
         h.addLayout(self._build_io_column("OUT", self.out_meter, self.k_out))
@@ -838,8 +853,12 @@ class MainWindow(QMainWindow):
     def _loop_clear(self) -> None:
         self.engine.looper.clear()
 
+    def _apply_tuner_mute(self, *_args) -> None:
+        self.engine.output_muted = self._tuner_on and self.tuner_mute.isChecked()
+
     def _set_tuner(self, on: bool) -> None:
         self._tuner_on = on
+        self._apply_tuner_mute()
         if on:
             self.focus_stack.setCurrentWidget(self._tuner_page)
         else:
@@ -959,12 +978,42 @@ class MainWindow(QMainWindow):
         presetlib.save_preset(PRESET_DIR, name, self.engine.chain.snapshot())
         self._flash(f"Saved '{name}'")
 
+    def _preset_exists(self, name: str) -> bool:
+        exists = getattr(presetlib, "preset_exists", None)
+        if exists is not None:
+            return exists(PRESET_DIR, name)
+        # Windows file names ignore case, so "clean" would overwrite "Clean".
+        return name.casefold() in {p.casefold() for p in presetlib.list_presets(PRESET_DIR)}
+
     def _save_preset_as(self) -> None:
-        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
-        name = name.strip()
-        if not ok or not name:
+        name = self._current_preset()
+        while True:
+            name, ok = QInputDialog.getText(self, "Save preset", "Preset name:",
+                                            text=name)
+            name = name.strip()
+            if not ok or not name:
+                return
+            validate = getattr(presetlib, "validate_name", None)
+            problem = validate(name) if validate is not None else ""
+            if problem:
+                QMessageBox.warning(self, "Tanin", problem)
+                continue
+            if not self._preset_exists(name):
+                break
+            box = QMessageBox(QMessageBox.Warning, "Tanin",
+                              f"A preset called '{name}' already exists.",
+                              parent=self)
+            box.setInformativeText("Replace it with your current sound?")
+            replace = box.addButton("Replace", QMessageBox.DestructiveRole)
+            box.addButton("Choose another name", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is replace:
+                break
+        try:
+            presetlib.save_preset(PRESET_DIR, name, self.engine.chain.snapshot())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Tanin", f"Could not save '{name}': {exc}")
             return
-        presetlib.save_preset(PRESET_DIR, name, self.engine.chain.snapshot())
         self._refresh_presets(select=name)
         self.preset_name.setText(name)
         self._flash(f"Saved '{name}'")
@@ -1093,6 +1142,7 @@ class MainWindow(QMainWindow):
             "samplerate": e.samplerate,
             "blocksize": e.blocksize,
             "exclusive": e.exclusive,
+            "tuner_mute": self.tuner_mute.isChecked(),
             "preset": self._current_preset(),
             "broadcast": self.engine.broadcast.enabled,
             "broadcast_name": dev_name(self.engine.broadcast_device),
@@ -1117,9 +1167,20 @@ class MainWindow(QMainWindow):
             self.in_meter.setChannelCount(nch)
             self.in_meter.labels = [str(i + 1) for i in range(nch)]
             self.in_meter.highlight = e.input_channel
-        self.in_meter.setLevels(e.channel_peaks[:nch])
-        out = e.chain["output"]
-        self.out_meter.setLevels(out.peak_l, out.peak_r)
+        if e.running:
+            # Highest peak since the last tick, so short picks are not missed.
+            pin, pout = e.read_meters()
+            self.in_meter.setLevels(pin[:nch])
+            self.out_meter.setLevels(pout[0], pout[1])
+        else:
+            self.in_meter.setLevels([0.0] * nch)
+            self.out_meter.setLevels(0.0, 0.0)
+        if e.in_clips != self._seen_in_clips:
+            self._seen_in_clips = e.in_clips
+            self.in_meter.setClipped(True)
+        if e.out_clips != self._seen_out_clips:
+            self._seen_out_clips = e.out_clips
+            self.out_meter.setClipped(True)
         self.load_ind.set_load(e.load, e.peak_load)
 
         if self._tick % 3 == 0:
