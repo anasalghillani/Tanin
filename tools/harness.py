@@ -639,7 +639,11 @@ def test_looper_safety():
     e._deadline = block / SR
     indata = np.zeros((block, 1), dtype=np.float32)
     outdata = np.zeros((block, 2), dtype=np.float32)
-    e.running = True          # as if the stream were live
+    class _LiveStream:        # stands in for an open stream
+        def stop(self): pass
+        def close(self): pass
+    e.stream = _LiveStream()
+    e.running = True
     e.looper.toggle()
     queued = e.looper.state == "empty" and len(e._commands) == 1
     e._callback(indata, outdata, block, None, None)
