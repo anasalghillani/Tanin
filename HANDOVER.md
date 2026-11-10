@@ -5,7 +5,7 @@ A real-time guitar amp and pedalboard for Windows, built in Python. It's a stand
 - **Location:** `%USERPROFILE%\Documents\AmpRack`
 - **Run:** `Tanin.cmd`, or `.venv\Scripts\python.exe run.py`
 - **List devices:** `.venv\Scripts\python.exe run.py --devices`
-- **Tests:** `.venv\Scripts\python.exe tools\harness.py`. This is **33/33 passing** and must stay green.
+- **Tests:** `.venv\Scripts\python.exe tools\harness.py`. This is **40/40 passing** and must stay green.
 - **GitHub:** https://github.com/anasalghillani/Tanin (public). Product name is **Tanin**;
   it was called AmpRack during development. The local folder is still `Documents\AmpRack`
   and the Python package is still `amprack` — renaming the folder breaks the venv's absolute

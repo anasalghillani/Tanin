@@ -18,7 +18,6 @@ from __future__ import annotations
 import gc
 import math
 import os
-import threading
 import time
 from collections import deque
 
@@ -269,6 +268,7 @@ class Engine:
     def __init__(self, recordings_dir: str):
         self.chain = Chain()
         self.looper = Looper()
+        self.looper.post = self.post   # loop buttons land between blocks
         self.recorder = Recorder(recordings_dir)
         self.metronome = Metronome()
         self.broadcast = BroadcastOut()
@@ -301,7 +301,6 @@ class Engine:
         self.stream_latency_ms = 0.0
 
         self._commands: deque = deque()
-        self._lock = threading.Lock()
         self._mono_in = np.zeros(0, dtype=np.float64)
         self._deadline = 1.0
 
@@ -483,6 +482,11 @@ class Engine:
                 s.close()
             except Exception:
                 pass
+        # A take cannot outlive its stream: with no callback feeding the ring
+        # the file would just stop growing while the UI still says
+        # "recording", and the next start() would resize the ring under the
+        # writer thread. Stopped after the stream so the last block is kept.
+        self.recorder.stop()
         if not gc.isenabled():
             gc.enable()
             gc.unfreeze()
@@ -502,7 +506,6 @@ class Engine:
         self.recorder.prepare(sr)
         self.metronome.prepare(sr)
         self._mono_in = np.zeros(n, dtype=np.float64)
-        self._silence = np.zeros(n, dtype=np.float64)
         self._deadline = n / sr
         self.xruns = 0
         self.callback_errors = 0
@@ -707,22 +710,6 @@ def broadcast_candidates(monitor_device: int | None) -> list[dict]:
     return out
 
 
-def _sink_score(name: str) -> int:
-    """Lower is safer to send audio into without hearing it.
-
-    'NVIDIA Broadcast' is deliberately *not* treated as silent: it is a
-    processing endpoint that forwards to a real output, so it usually is
-    audible despite looking virtual.
-    """
-    n = name.lower()
-    if "steam streaming" in n:
-        return 0
-    if any(k in n for k in ("cable", "voicemeeter", "vb-audio", "vdvad",
-                            "vad ", "_vad", "virtual")):
-        return 1
-    return 2
-
-
 def suggest_broadcast_device(monitor_device: int | None) -> int | None:
     cands = broadcast_candidates(monitor_device)
     return cands[0]["index"] if cands else None
@@ -747,6 +734,25 @@ def find_device(name: str, api: str, kind: str) -> int | None:
         if d["name"] == name:
             return d["index"]
     return None
+
+
+def resolve_device(name: str, api: str, kind: str,
+                   index_hint: int | None, default: int | None) -> int | None:
+    """Turn a saved device back into a live index, or fall back to `default`.
+
+    When a name was saved, only that name counts: if the interface is
+    unplugged the old index now belongs to some other device, and opening it
+    would silently play through the wrong hardware. The bare index is only
+    trusted for settings written before names were saved, and only if it
+    still exists.
+    """
+    if name:
+        found = find_device(name, api, kind)
+        return found if found is not None else default
+    if index_hint is not None and any(
+            d["index"] == index_hint for d in list_devices(kind)):
+        return index_hint
+    return default
 
 
 def list_devices(kind: str) -> list[dict]:
