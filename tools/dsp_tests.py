@@ -266,7 +266,7 @@ def test_gate_flutter(check):
 
     g = NoiseGate()
     g.enabled = True
-    g.threshold_db = -45.0
+    g.threshold_db = -40.0
     g.prepare(SR, 256)
     y = _run(g, x, 256)
     n = len(y)
@@ -275,7 +275,8 @@ def test_gate_flutter(check):
     env_out = np.abs(hilbert(y))
     gain = env_out / np.maximum(env_in, 1e-9)
     # Look only where the note is still clearly above the hiss.
-    keep = amp[:n] > 0.004
+    keep = amp[:n] > 0.002
+    keep[:int(SR * 0.05)] = False     # skip the opening and the Hilbert edge
     gdb = 20 * np.log10(np.maximum(gain[keep], 1e-6))
     # Downsample to 5 ms steps and count re-openings (gain rising >1 dB
     # after it has started closing).
@@ -284,7 +285,8 @@ def test_gate_flutter(check):
     lowest = g5[0]
     reopen = 0
     for v in g5[1:]:
-        if v > lowest + 1.0 and lowest < -1.0:
+        # Below -30 dB the "gain" is mostly the hiss floor; ignore it.
+        if v > lowest + 1.0 and -30.0 < lowest < -1.0:
             reopen += 1
             lowest = v
         lowest = min(lowest, v)
@@ -294,6 +296,23 @@ def test_gate_flutter(check):
           f"{reopen} re-openings")
     check("gate gain has no audio-rate ripple (<3 dB per 5 ms)", ripple < 3.0,
           f"worst 5 ms step {ripple:.1f} dB")
+
+    # A sustained note wobbling +/-3 dB right at the threshold: the chatter
+    # case. With hysteresis the gate must simply stay open.
+    rng = np.random.default_rng(5)
+    t = np.arange(int(SR * 3.0)) / SR
+    amp = 0.01 * 10 ** (3 * np.sin(2 * math.pi * 3 * t) / 20)
+    x = amp * np.sin(2 * math.pi * 82.41 * t) + rng.standard_normal(len(t)) * 5e-4
+    g = NoiseGate()
+    g.enabled = True
+    g.threshold_db = -40.0
+    g.prepare(SR, 256)
+    y = _run(g, x, 256)
+    n = len(y)
+    gain = np.abs(hilbert(y)) / np.maximum(np.abs(hilbert(x[:n])), 1e-9)
+    gdb = 20 * np.log10(np.maximum(gain[4800:-4800], 1e-6))
+    check("note hovering at the threshold does not chatter (gain stays within 1 dB)",
+          float(gdb.min()) > -1.0, f"lowest gain {float(gdb.min()):.1f} dB")
 
 
 # --------------------------------------------------------------------------

@@ -74,7 +74,22 @@ class Block:
 # ==========================================================================
 
 class NoiseGate(Block):
+    """Hysteresis gate.
+
+    The old gate mapped a 1 ms envelope straight onto gain through a soft
+    knee. A 1 ms envelope ripples at twice the note's frequency, so as a low
+    note decayed through the knee the gain rippled with it (audible flutter)
+    and the gate re-opened on every ripple peak.
+
+    Now: a fast and a slow envelope (the larger wins, so the pick attack is
+    caught in ~0.5 ms but the envelope does not sag between cycles), and a
+    two-threshold switch -- it opens at the threshold and only closes once the
+    envelope falls 8 dB below it. The 0/1 result is then smoothed with the
+    attack and release times, so the close is a clean fade.
+    """
+
     name = "gate"
+    HYSTERESIS_DB = 8.0
 
     def __init__(self):
         super().__init__()
@@ -82,38 +97,48 @@ class NoiseGate(Block):
         self.threshold_db = -55.0
         self.attack_ms = 2.0
         self.release_ms = 120.0
-        self._det = OnePole(3.0)
-        self._smooth = OnePole(10.0)
+        self._det_fast = OnePole(0.5)
+        self._det_slow = OnePole(15.0)
+        self._smooth = OnePole(2.0)
         self._rel = OnePole(120.0)
+        self._open = 0.0
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        for f in (self._det, self._smooth, self._rel):
+        for f in (self._det_fast, self._det_slow, self._smooth, self._rel):
             f.prepare(sr, 1)
-            f.reset()
+        self._idx = np.arange(max_block)
+        self.reset()
 
     def reset(self):
-        for f in (self._det, self._smooth, self._rel):
+        for f in (self._det_fast, self._det_slow, self._smooth, self._rel):
             f.reset()
+        self._open = 0.0
 
     def _process(self, x, n):
-        self._det.set_tau(1.0)
-        env = self._det.process(np.abs(x))
-        thr = db2lin(self.threshold_db)
-        # Soft knee over 6 dB so a decaying note fades rather than chops.
-        lo = thr * 0.5
-        g = np.clip((env - lo) / (thr - lo + 1e-12), 0.0, 1.0)
-        g *= g  # square the curve -> gentler open, faster close
+        rect = np.abs(x)
+        env = np.maximum(self._det_fast.process(rect), self._det_slow.process(rect))
+        thr_open = db2lin(self.threshold_db)
+        thr_close = thr_open * db2lin(-self.HYSTERESIS_DB)
+
+        # Hysteresis, vectorised: mark samples that force open (1) or closed
+        # (0), then carry the last decision forward across the in-between
+        # samples (and across the block boundary via self._open).
+        decided = (env > thr_open) | (env < thr_close)
+        last = np.where(decided, self._idx[:n], -1)
+        np.maximum.accumulate(last, out=last)
+        state = np.where(env > thr_open, 1.0, 0.0)
+        target = np.where(last >= 0, state[np.maximum(last, 0)], self._open)
+        self._open = float(target[-1])
 
         # Asymmetric ballistics without a per-sample branch: run a fast and a
         # slow smoother and take the larger. A rising target is tracked by the
         # fast one (snappy open); a falling target is held up by the slow one
         # (long, natural close). Choosing per block instead would make the
-        # result depend on buffer size, which is a bug you only hear after
-        # someone changes their latency setting.
+        # result depend on buffer size.
         self._smooth.set_tau(self.attack_ms)
         self._rel.set_tau(self.release_ms)
-        gs = np.maximum(self._smooth.process(g), self._rel.process(g))
+        gs = np.maximum(self._smooth.process(target), self._rel.process(target))
         return x * gs
 
 
