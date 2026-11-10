@@ -210,7 +210,7 @@ class Drive(Block):
         self._tone_lp = Biquad("lowpass", 5500.0, 0.707)
         self._post_lp = Biquad("lowpass", 6000.0, 0.707)
         self._dc = DCBlocker()
-        self._os = Oversampler(factor=4, order=6)
+        self._os = Oversampler()
         self._out = SmoothedParam(1.0)
 
     def prepare(self, sr, max_block):
@@ -346,7 +346,7 @@ class Amp(Block):
         self._presence = Biquad("highshelf", 5200.0, 0.707)
         self._out_lp = Biquad("lowpass", 7000.0, 0.707)
         self._dc = DCBlocker()
-        self._os = Oversampler(factor=4, order=6)
+        self._os = Oversampler()
         self._sag_env = OnePole(60.0)
         self._master = SmoothedParam(0.5)
         self.output_level = 0.0  # telemetry
