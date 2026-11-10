@@ -640,23 +640,30 @@ class Modulation(Block):
 
     # -- individual modes ---------------------------------------------------
 
-    def _chorus(self, x, n):
+    def _chorus(self, x, n, vibrato=False):
         rate = 0.05 + self.rate * 4.0
         depth_ms = 1.0 + self.depth * 7.0
-        # The shortest excursion must still be at least one block behind the
-        # write head (see DelayLine's ordering contract), so the centre delay
-        # is pushed out at large buffer sizes rather than allowed to alias.
-        min_ms = (n / self.sr) * 1000.0 + 0.5
-        base_ms = max(14.0, min_ms + depth_ms)
+        if vibrato:
+            # Vibrato is 100% wet, so its centre delay is pure latency. Sit it
+            # just past the deepest excursion (depth 0.5: ~4.6 ms) instead of
+            # the chorus' 14 ms.
+            base_ms = depth_ms + 0.1
+        else:
+            base_ms = 14.0
         spread = 0.25 * clampf(self.stereo_spread, 0.0, 1.0)
         ph = self._lfo.phase_block(rate, n)
         l = np.sin(2 * math.pi * ph)
         r = np.sin(2 * math.pi * (ph + spread))
-        dl = (base_ms + depth_ms * l) * 1e-3 * self.sr
-        dr = (base_ms + depth_ms * r) * 1e-3 * self.sr
+        # No feedback here, so write first and read at (delay + n): after the
+        # write the newest input sample is n behind the head. That allows any
+        # delay >= 0 whatever the buffer size. (The old read-then-write order
+        # needed delay >= n, which pushed the chorus centre -- and vibrato's
+        # latency -- out to ~48 ms at a 2048 buffer.)
+        self._line.write(x)
+        dl = (base_ms + depth_ms * l) * 1e-3 * self.sr + n
+        dr = (base_ms + depth_ms * r) * 1e-3 * self.sr + n
         wl = self._line.read_modulated(dl, n)[0]
         wr = self._line.read_modulated(dr, n)[1]
-        self._line.write(x)
         return np.stack((wl, wr))
 
     def _flanger(self, x, n):
@@ -745,7 +752,7 @@ class Modulation(Block):
         if mode == "Chorus":
             wet = self._chorus(x, n)
         elif mode == "Vibrato":
-            return self._chorus(x, n)   # 100% wet: pitch wobble, no comb
+            return self._chorus(x, n, vibrato=True)  # 100% wet: pitch wobble, no comb
         elif mode == "Flanger":
             wet = self._flanger(x, n)
         elif mode == "Phaser":
