@@ -147,4 +147,58 @@ QCheckBox::indicator {{
     border: 1px solid {STROKE_HI}; background: {PANEL_HI};
 }}
 QCheckBox::indicator:checked {{ background: {AMBER}; border-color: {AMBER}; }}
+
+QFrame#Focus {{
+    background: {PANEL};
+    border: 1px solid {STROKE};
+    border-radius: 12px;
+}}
+QFrame#Focus QFrame#Card {{ background: transparent; border: none; }}
+QFrame#Focus QStackedWidget, QFrame#Focus QStackedWidget > QWidget {{ background: transparent; }}
+QFrame#VLine {{ background: {STROKE}; border: none; }}
+QLabel#PresetName {{ font-size: 17px; font-weight: 700; color: {TEXT}; }}
+QLabel#Arrow {{ color: {TEXT_FAINT}; font-size: 15px; }}
+
+QPushButton#Icon {{ padding: 0px 10px 3px 10px; font-size: 20px; font-weight: 400; }}
+QPushButton#Pill {{
+    border-radius: 13px; padding: 4px 12px; font-weight: 600;
+    background: {PANEL_HI};
+}}
+
+QListWidget#Presets {{
+    background: transparent; border: none; outline: none; font-size: 13px;
+}}
+QListWidget#Presets::item {{
+    padding: 7px 10px; border-radius: 6px; margin: 1px 0; color: {TEXT_DIM};
+}}
+QListWidget#Presets::item:hover {{ background: {PANEL_HI}; color: {TEXT}; }}
+QListWidget#Presets::item:selected {{
+    background: {PANEL_HI}; color: {AMBER}; font-weight: 700;
+    border-left: 3px solid {AMBER};
+}}
+
+QTabWidget::pane {{
+    background: {PANEL}; border: 1px solid {STROKE};
+    border-radius: 10px; top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent; color: {TEXT_DIM}; padding: 6px 16px;
+    font-weight: 700; letter-spacing: 1px; font-size: 11px;
+    border: 1px solid transparent; border-bottom: none;
+    border-top-left-radius: 8px; border-top-right-radius: 8px;
+}}
+QTabBar::tab:selected {{
+    background: {PANEL}; color: {TEXT}; border-color: {STROKE};
+}}
+QTabBar::tab:hover:!selected {{ color: {TEXT}; }}
+
+QDialog {{ background: {BG}; }}
+QGroupBox {{
+    background: {PANEL}; border: 1px solid {STROKE}; border-radius: 10px;
+    margin-top: 22px; padding: 14px 12px 10px 12px; font-weight: 700;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin; left: 12px; top: 2px; color: {TEXT_DIM};
+    letter-spacing: 1.4px; font-size: 11px;
+}}
 """

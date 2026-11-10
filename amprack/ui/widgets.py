@@ -239,7 +239,7 @@ class Knob(QWidget):
         f = QFont(self.font())
         f.setPointSizeF(7.6)
         f.setBold(showing_value)
-        f.setLetterSpacing(QFont.PercentageSpacing, 104 if showing_value else 112)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 0.3 if showing_value else 0.8)
         p.setFont(f)
         p.setPen(QPen(acc if showing_value and self._active
                       else _c(theme.TEXT_DIM if self._active else theme.TEXT_FAINT)))
@@ -343,7 +343,7 @@ class LevelMeter(QWidget):
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.setFixedHeight(8 * channels + 2)
         else:
-            self.setFixedWidth(10 * channels + 2)
+            self.setFixedWidth(12 * channels + 2)
             self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.updateGeometry()
 
@@ -377,12 +377,23 @@ class LevelMeter(QWidget):
         w, h = self.width(), self.height()
         n = self.channels
         pad = 14 if (self.labels and self.horizontal) else 0
+        vpad = 14 if (self.labels and not self.horizontal) else 0
         for i in range(n):
             if self.horizontal:
                 bar = QRectF(pad, i * 8 + 1, w - pad, 6)
             else:
-                bar = QRectF(i * 10 + 1, 0, 8, h)
+                bar = QRectF(i * 12 + 2, 0, 8, h - vpad)
             p.fillRect(bar, _c("#14171d"))
+
+            if vpad and i < len(self.labels):
+                f = QFont(self.font())
+                f.setPointSizeF(7.0)
+                f.setBold(i == self.highlight)
+                p.setFont(f)
+                p.setPen(QPen(_c(theme.AMBER if i == self.highlight
+                                 else theme.TEXT_FAINT)))
+                p.drawText(QRectF(bar.left() - 3, h - vpad + 1, bar.width() + 6, 12),
+                           Qt.AlignHCenter | Qt.AlignVCenter, self.labels[i])
 
             if pad and i < len(self.labels):
                 f = QFont(self.font())
@@ -523,7 +534,8 @@ class TunerDisplay(QWidget):
 
         # Segment strip: 21 segments spanning +/-50 cents.
         segs = 21
-        strip_y = h - 22
+        strip_h = 8 if h < 140 else 14
+        strip_y = h - strip_h - 14
         seg_w = (w - 12) / segs
         centre = segs // 2
         lit = centre
@@ -532,7 +544,7 @@ class TunerDisplay(QWidget):
             lit = max(0, min(segs - 1, lit))
         for i in range(segs):
             x = 6 + i * seg_w
-            rect = QRectF(x + 1, strip_y, seg_w - 2, 8)
+            rect = QRectF(x + 1, strip_y, seg_w - 2, strip_h)
             is_centre = i == centre
             if self.active and i == lit:
                 c = col
@@ -544,16 +556,18 @@ class TunerDisplay(QWidget):
                 c = _c(theme.AMBER, 110)
             p.fillRect(rect, c)
 
-        # Note name
+        # Note name -- grows with the widget so the big tuner page reads
+        # from across the room.
+        note_h = max(40.0, (h - 30) * 0.68)
         f = QFont(self.font())
-        f.setPointSizeF(24)
+        f.setPixelSize(int(max(30, note_h * 0.62)))
         f.setBold(True)
         p.setFont(f)
         p.setPen(QPen(col))
         name = self.note if self.active else "--"
-        p.drawText(QRectF(0, 2, w, 40), Qt.AlignCenter, name)
+        p.drawText(QRectF(0, 0, w, note_h), Qt.AlignCenter, name)
 
-        f.setPointSizeF(8.5)
+        f.setPixelSize(int(max(11, note_h * 0.12)))
         f.setBold(False)
         p.setFont(f)
         p.setPen(QPen(_c(theme.TEXT_DIM)))
@@ -561,7 +575,8 @@ class TunerDisplay(QWidget):
             sub = f"{self.octave}   {self.freq:6.1f} Hz   {self.cents:+.0f}¢"
         else:
             sub = "play a string"
-        p.drawText(QRectF(0, 40, w, 16), Qt.AlignCenter, sub)
+        p.drawText(QRectF(0, note_h, w, max(16, strip_y - note_h - 4)),
+                   Qt.AlignCenter, sub)
         p.end()
 
 
@@ -601,4 +616,120 @@ class LoadIndicator(QWidget):
         p.setFont(f)
         p.setPen(QPen(_c(theme.TEXT_DIM)))
         p.drawText(r, Qt.AlignCenter, f"DSP {self.load*100:.0f}%")
+        p.end()
+
+
+# ==========================================================================
+# Signal-chain tile
+# ==========================================================================
+
+class ChainTile(QWidget):
+    """One stop in the signal chain. Click the body to edit the module, click
+    the dot to switch it on or off. Off modules go grey so the path your
+    signal actually takes reads at a glance."""
+
+    selected = Signal(str)
+    powerToggled = Signal(str, bool)
+
+    def __init__(self, key: str, title: str, accent: str,
+                 always_on: bool = False, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.title = title
+        self.accent = accent
+        self.always_on = always_on
+        self.subtitle = ""
+        self._on = True
+        self._selected = False
+        self._hover = False
+        self.setFixedHeight(66)
+        self.setMinimumWidth(92)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+
+    def _led_rect(self) -> QRectF:
+        return QRectF(self.width() - 24, 9, 14, 14)
+
+    def set_state(self, on: bool, subtitle: str) -> None:
+        on = True if self.always_on else bool(on)
+        if on != self._on or subtitle != self.subtitle:
+            self._on, self.subtitle = on, subtitle
+            self.update()
+
+    def set_selected(self, sel: bool) -> None:
+        if sel != self._selected:
+            self._selected = sel
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        if not self.always_on and self._led_rect().adjusted(-6, -6, 6, 6).contains(
+                e.position()):
+            self._on = not self._on
+            self.update()
+            self.powerToggled.emit(self.key, self._on)
+        else:
+            self.selected.emit(self.key)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        bg = "#262b36" if self._selected else ("#20242d" if self._hover else "#1a1d24")
+        p.fillPath(path, _c(bg))
+        acc = _c(self.accent) if self._on else _c(theme.TEXT_FAINT)
+
+        # accent bar along the top
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(QRectF(r.left(), r.top(), r.width(), 4),
+                   _c(self.accent, 255 if self._on else 60))
+        p.restore()
+
+        border = _c(self.accent) if self._selected else _c(
+            theme.STROKE_HI if self._hover else theme.STROKE)
+        p.setPen(QPen(border, 1.6 if self._selected else 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
+        # power dot
+        if not self.always_on:
+            lr = self._led_rect()
+            if self._on:
+                p.setBrush(QBrush(acc))
+                p.setPen(QPen(_c(self.accent), 1.2))
+            else:
+                p.setBrush(QBrush(_c("#14171d")))
+                p.setPen(QPen(_c(theme.STROKE_HI), 1.2))
+            p.drawEllipse(lr)
+
+        f = QFont(self.font())
+        f.setPixelSize(11)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+        p.setFont(f)
+        p.setPen(QPen(_c(theme.TEXT) if self._on else _c(theme.TEXT_FAINT)))
+        p.drawText(QRectF(11, 12, r.width() - 40, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                   self.title)
+
+        f.setBold(False)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 0.0)
+        f.setPixelSize(11)
+        p.setFont(f)
+        p.setPen(QPen(acc if self._on else _c(theme.TEXT_FAINT)))
+        sub = self.subtitle if self._on else "off"
+        p.drawText(QRectF(11, 34, r.width() - 18, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(sub, Qt.ElideRight, int(r.width() - 18)))
         p.end()
