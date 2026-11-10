@@ -1,0 +1,12 @@
+# environment
+.venv/
+__pycache__/
+*.pyc
+
+# Per-machine and personal data. Never publish.
+# settings.json: device names and choices for this computer
+settings.json
+# recordings/: your takes, including the raw DI track
+recordings/
+# presets/: factory presets are regenerated from presets.py on first run
+presets/
