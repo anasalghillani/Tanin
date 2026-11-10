@@ -244,10 +244,19 @@ class Drive(Block):
         up = self._os.up(pre)
         if shaper_name == "tube":
             shaped = shaper(up, gain, bias)
+        elif bias:
+            # Bias offsets the signal *into* the clipper (in units of the
+            # clipping threshold), so one half-cycle clips earlier than the
+            # other -- that asymmetry is what makes even harmonics. Adding it
+            # after the shaper (the old code) was just DC, which the DC
+            # blocker then removed, so the knob did nothing. The static
+            # offset shaper(bias) is subtracted so engaging the pedal does
+            # not thump.
+            b_in = bias / gain
+            shaped = shaper(up + b_in, gain)
+            shaped -= shaper(np.array([b_in]), gain)[0]
         else:
             shaped = shaper(up, gain)
-            if bias:
-                shaped = shaped + bias * 0.5
         wet = self._os.down(shaped)
         wet = self._dc.process(wet)
 
@@ -867,8 +876,15 @@ class Reverb(Block):
                           for t in _COMB_TUNING]
         self._ap_len = [[int(t * scale), int((t + _STEREO_SPREAD) * scale)]
                         for t in _ALLPASS_TUNING]
+        # Feedback across a delay shorter than the block cannot be done
+        # block-at-a-time, so both the combs and the allpasses run in chunks
+        # no longer than their shortest delay. That keeps every line at its
+        # true length whatever the driver buffer is (the old code clamped the
+        # combs to the block length, so at 2048 they all collapsed together).
         min_delay = min(min(p) for p in self._ap_len)
         self._chunk = max(16, min(max_block, min_delay - 1))
+        min_comb = min(min(p) for p in self._comb_len)
+        self._comb_chunk = max(16, min(max_block, min_comb))
 
         self._comb_lines = [DelayLine(max(l) + max_block + 8, 2) for l in self._comb_len]
         self._ap_lines = [DelayLine(max(l) + max_block + 8, 2) for l in self._ap_len]
@@ -907,29 +923,38 @@ class Reverb(Block):
 
         # Pre-delay separates the source from the tail; without it a big reverb
         # smears the pick attack and everything sounds far away.
-        self._pre.write(x)
+        # There is no feedback here, so this is the one place a line may be
+        # written *before* it is read: after the write, the newest input sample
+        # sits n behind the head, so reading at pd + n gives exactly pd -- even
+        # when pd is shorter than the block. (The old code read at pd after
+        # writing, which made every pre-delay one buffer short.)
         pd = int((self.predelay_ms + extra_pre * 20.0) * 1e-3 * self.sr)
-        pd = max(pd, n + 1)
-        src = self._pre.read_fixed(pd, n) * 0.015
+        pd = min(max(pd, 0), int(self.sr * 0.25))
+        self._pre.write(x)
+        src = self._pre.read_fixed(pd + n, n) * 0.015
 
         acc = self._scratch[:, :n]
         acc[...] = 0.0
 
-        # Parallel comb filters -> the tail's density.
-        for i, dl in enumerate(self._comb_lines):
-            dL = max(self._comb_len[i][0], n + 1)
-            dR = max(self._comb_len[i][1], n + 1)
-            outL = dl.read_fixed(dL, n)[0]
-            outR = dl.read_fixed(dR, n)[1]
-            out = np.stack((outL, outR))
-            f = self._comb_damp[i]
+        # Parallel comb filters -> the tail's density. Chunked so each comb
+        # keeps its own length (see prepare()).
+        for i, f in enumerate(self._comb_damp):
             # Damping is a one-pole lowpass inside the feedback path: high
             # frequencies die away faster than lows, as in a real room.
             f.b[0] = 1.0 - damp
             f.a[1] = -damp
-            filt = f.process(out)
-            dl.write(src + filt * room)
-            acc += out
+        cc = self._comb_chunk
+        pos = 0
+        while pos < n:
+            k = min(cc, n - pos)
+            s_seg = src[:, pos:pos + k]
+            for i, dl in enumerate(self._comb_lines):
+                dL, dR = self._comb_len[i]
+                out = np.stack((dl.read_fixed(dL, k)[0], dl.read_fixed(dR, k)[1]))
+                filt = self._comb_damp[i].process(out)
+                dl.write(s_seg + filt * room)
+                acc[:, pos:pos + k] += out
+            pos += k
 
         acc *= 0.25
 
