@@ -469,32 +469,10 @@ def test_tuner():
 
 
 # --------------------------------------------------------------------------
-# 9. Distortion aliasing -- the reason for the oversampler
+# 9. Distortion aliasing -- moved to tools/dsp_tests.py (test_aliasing_real).
+#    The old version used a 2 kHz tone, which divides 48 kHz exactly, so every
+#    folded harmonic landed on a real one and the test could not see aliasing.
 # --------------------------------------------------------------------------
-
-def test_aliasing():
-    print("\n[9] distortion aliasing")
-    # A 2 kHz sine into a high-gain amp. Harmonics land at 4, 6, 8 kHz...
-    # Anything appearing at a non-multiple of 2 kHz is folded aliasing.
-    x = sine(2000.0, 1.0, 0.4)
-    c = Chain()
-    c.prepare(SR, 256)
-    c["amp"].model = "Metal"
-    c["amp"].gain = 0.95
-    c["cab"].enabled = False
-    y = run_blocks(c, x, 256)[0]
-    seg = y[-32768:] * np.hanning(32768)
-    spec = np.abs(np.fft.rfft(seg))
-    freqs = np.fft.rfftfreq(32768, 1 / SR)
-    harmonic = np.zeros(len(freqs), dtype=bool)
-    for k in range(1, 12):
-        harmonic |= np.abs(freqs - 2000.0 * k) < 60.0
-    harmonic |= freqs < 120.0
-    total = float(np.sum(spec[harmonic] ** 2))
-    alias = float(np.sum(spec[~harmonic] ** 2))
-    ratio_db = 10 * math.log10(alias / max(total, 1e-20))
-    check("aliasing at least 30 dB below the harmonic series", ratio_db < -30.0,
-          f"alias/harmonic = {ratio_db:.1f} dB")
 
 
 # --------------------------------------------------------------------------
@@ -571,9 +549,10 @@ def main():
     test_midstream_events()
     test_looper()
     test_tuner()
-    test_aliasing()
     test_cpu_budget()
     test_broadcast_drift()
+    from dsp_tests import run_all as run_dsp_audit  # noqa: E402
+    run_dsp_audit(check)
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)
