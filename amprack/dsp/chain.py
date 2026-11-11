@@ -117,14 +117,54 @@ class Chain:
 
     def apply(self, state: dict) -> None:
         """Load a preset. Safe from any thread for scalars; the engine routes
-        this through its command queue so it lands between blocks."""
+        this through its command queue so it lands between blocks.
+
+        A preset is a *complete* sound: any block or parameter it leaves out
+        goes back to its factory default rather than keeping whatever the last
+        preset set. Otherwise the gate from a metal preset stays on in the
+        clean preset loaded after it, and a preset sounds different depending
+        on what was loaded before it.
+
+        Two things are deliberately not reset when absent: the input gain,
+        which belongs to the guitar and interface rather than to the sound,
+        and the IR file, which the engine loads (file I/O cannot happen here,
+        see ``Engine.apply_preset``).
+
+        Values are coerced to the default's type and anything unusable falls
+        back to the default, because this runs on the audio thread and a
+        string where a float belongs would raise on every block.
+        """
+        if not isinstance(state, dict):
+            return
         if "input_gain_db" in state:
-            self.input_gain_db = float(state["input_gain_db"])
+            self.input_gain_db = _coerce(state["input_gain_db"], self.input_gain_db)
         for key, names in self.PARAM_SPEC.items():
             src = state.get(key)
             if not isinstance(src, dict):
-                continue
+                src = {}
             b = self.blocks[key]
+            defaults = _DEFAULTS[key]
             for nm in names:
-                if nm in src:
-                    setattr(b, nm, src[nm])
+                if nm == "ir_path":
+                    continue
+                setattr(b, nm, _coerce(src.get(nm, defaults[nm]), defaults[nm]))
+
+
+def _coerce(value, default):
+    """``value`` as the same type as ``default``, or ``default`` if it can't be."""
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else default
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            return default
+        v = float(value)
+        return v if np.isfinite(v) else default
+    if isinstance(default, str):
+        return value if isinstance(value, str) else default
+    return default
+
+
+# What a freshly built chain looks like: the reference "omitted means this".
+# Built once at import from the blocks' own constructors, so a new parameter
+# picks up its default here without a second list to keep in sync.
+_DEFAULTS = Chain().snapshot()
