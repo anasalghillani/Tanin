@@ -39,6 +39,7 @@ from ..engine import (
     broadcast_candidates,
     default_devices,
     find_device,
+    resolve_device,
     hostapi_name,
     is_asio,
     list_devices,
@@ -876,7 +877,7 @@ class MainWindow(QMainWindow):
             path = rec.start()
             self.rec_status.setText(os.path.basename(path))
         else:
-            path = rec.stop()
+            path = rec.stop() or rec.wet_path
             if rec.last_error:
                 self.rec_status.setText(f"error: {rec.last_error}")
             elif path:
@@ -1100,17 +1101,16 @@ class MainWindow(QMainWindow):
             pass
         e = self.engine
         din, dout = default_devices()
-        # Prefer name+API; the stored index is only a last-resort hint because
-        # PortAudio renumbers devices whenever the hardware or host API set
-        # changes.
-        e.input_device = (
-            find_device(self._settings.get("input_name", ""),
-                        self._settings.get("input_api", ""), "input")
-            or self._settings.get("input_device", din) or din)
-        e.output_device = (
-            find_device(self._settings.get("output_name", ""),
-                        self._settings.get("output_api", ""), "output")
-            or self._settings.get("output_device", dout) or dout)
+        # Prefer name+API. If the saved interface is unplugged, fall back to
+        # the default rather than to whatever now sits at the old index.
+        e.input_device = resolve_device(
+            self._settings.get("input_name", ""),
+            self._settings.get("input_api", ""), "input",
+            self._settings.get("input_device"), din)
+        e.output_device = resolve_device(
+            self._settings.get("output_name", ""),
+            self._settings.get("output_api", ""), "output",
+            self._settings.get("output_device"), dout)
         e.input_channel = self._settings.get("input_channel", 0)
         e.broadcast.enabled = self._settings.get("broadcast", False)
         e.broadcast_device = find_device(self._settings.get("broadcast_name", ""),
@@ -1195,6 +1195,9 @@ class MainWindow(QMainWindow):
 
         if e.recorder.recording:
             self.rec_status.setText(f"recording  {e.recorder.seconds_written:5.1f}s")
+        elif self.btn_rec.isChecked():
+            # Stopping audio ends the take; keep the button honest.
+            self.btn_rec.setChecked(False)
 
         # Tuner at ~8 Hz: the estimate needs a long window and the eye cannot
         # follow anything faster anyway.

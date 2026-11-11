@@ -821,6 +821,150 @@ def test_presets_and_ir():
           "raised ValueError" if raised else "wrote it")
 
 
+# --------------------------------------------------------------------------
+# 13. Looper, recorder and device bookkeeping
+# --------------------------------------------------------------------------
+
+def _record_loop(lp: Looper, seconds: float = 1.0, block: int = 256) -> float:
+    """Record a pluck into an empty looper and close it. Returns its rms."""
+    src = pluck(220.0, seconds, 0.5)
+    src = np.stack((src, src))
+    lp.record()
+    for i in range(0, (src.shape[1] // block) * block, block):
+        lp.process(src[:, i:i + block].copy(), block)
+    lp.play()
+    return _loop_rms(lp, block)
+
+
+def _loop_rms(lp: Looper, block: int = 256) -> float:
+    if lp.length <= 0 or lp.state not in ("playing", "overdubbing"):
+        return 0.0
+    keep = lp.pos
+    lp.pos = 0.0
+    got = np.zeros((2, lp.length))
+    silence = np.zeros((2, block))
+    for i in range(0, lp.length - block, block):
+        got[:, i:i + block] = lp.process(silence.copy(), block)
+    lp.pos = keep
+    return float(np.sqrt(np.mean(got ** 2)))
+
+
+def test_looper_safety():
+    print("\n[13] looper / recorder / devices")
+    block = 256
+
+    # 9. Clear must be undoable: one stray press of "C" should not cost a take.
+    lp = Looper(max_seconds=10.0)
+    lp.prepare(SR, block)
+    before = _record_loop(lp)
+    lp.clear()
+    cleared = lp.state == "empty" and lp.length == 0
+    ok = lp.undo()
+    lp.play()
+    after = _loop_rms(lp)
+    check("undo brings back a cleared loop",
+          cleared and ok and before > 0.01
+          and abs(after - before) / before < 0.02,
+          f"rms {before:.4f} -> clear -> undo -> {after:.4f}")
+
+    # Recording a new loop after a clear must not destroy the old one either.
+    lp.clear()
+    _record_loop(lp, 0.5)
+    new_len = lp.length
+    lp.undo()
+    lp.play()
+    back = _loop_rms(lp)
+    check("undo after re-recording swaps the cleared loop back",
+          abs(back - before) / before < 0.02 and lp.length != new_len,
+          f"rms {back:.4f} (target {before:.4f})")
+
+    # 10a. Restarting audio (same rate) must keep the loop and its undo.
+    lp = Looper(max_seconds=10.0)
+    lp.prepare(SR, block)
+    before = _record_loop(lp)
+    lp.prepare(SR, 512)
+    after = _loop_rms(lp)
+    check("audio restart keeps the loop",
+          lp.state == "playing" and abs(after - before) / before < 0.02,
+          f"state {lp.state}, rms {before:.4f} -> {after:.4f}")
+
+    # 10b. With an engine attached, looper buttons only queue work; the
+    # change lands at the top of the next audio block, never mid-block.
+    from amprack.engine import Engine
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="tanin-harness-")
+    e = Engine(tmp)
+    e.chain.prepare(SR, block)
+    e.looper.prepare(SR, block)
+    e.recorder.prepare(SR)
+    e.metronome.prepare(SR)
+    e.active_blocksize = block
+    e._deadline = block / SR
+    indata = np.zeros((block, 1), dtype=np.float32)
+    outdata = np.zeros((block, 2), dtype=np.float32)
+    class _LiveStream:        # stands in for an open stream
+        def stop(self): pass
+        def close(self): pass
+    e.stream = _LiveStream()
+    e.running = True
+    e.looper.toggle()
+    queued = e.looper.state == "empty" and len(e._commands) == 1
+    e._callback(indata, outdata, block, None, None)
+    check("looper buttons go through the engine queue",
+          queued and e.looper.state == "recording" and e.callback_errors == 0,
+          f"before block: queued={queued}; after block: {e.looper.state}")
+
+    # 17. Stopping audio must also end a recording, and the file must hold
+    # what was captured.
+    import soundfile as sf
+    e.recorder.start("harness")
+    tone = np.sin(2 * np.pi * 440 * np.arange(block) / SR).astype(np.float32)
+    indata[:, 0] = tone * 0.3
+    for _ in range(40):
+        e._callback(indata, outdata, block, None, None)
+    e.stop()
+    frames = 0
+    try:
+        frames = sf.info(e.recorder.wet_path).frames
+    except Exception:
+        pass
+    check("stopping audio stops the recorder and keeps the take",
+          not e.recorder.recording and frames == 40 * block,
+          f"recording={e.recorder.recording}, {frames} frames saved")
+
+    # 15. A saved device that is no longer plugged in must fall back to the
+    # default, not to whatever now sits at the old index.
+    import amprack.engine as eng
+    fake = [
+        {"index": 0, "name": "Microphone (Realtek)", "api": "Windows WASAPI",
+         "channels": 2, "default_sr": 48000, "rank": 1},
+        {"index": 3, "name": "Line In (Webcam)", "api": "Windows WASAPI",
+         "channels": 1, "default_sr": 48000, "rank": 1},
+    ]
+    real = eng.list_devices
+    eng.list_devices = lambda kind: fake
+    try:
+        gone = eng.resolve_device("AudioBox ASIO Driver", "ASIO", "input",
+                                  index_hint=3, default=0)
+        present = eng.resolve_device("Microphone (Realtek)", "Windows WASAPI",
+                                     "input", index_hint=7, default=3)
+        legacy = eng.resolve_device("", "", "input", index_hint=3, default=0)
+        stale = eng.resolve_device("", "", "input", index_hint=9, default=0)
+    finally:
+        eng.list_devices = real
+    check("unplugged saved device falls back to the default",
+          gone == 0 and present == 0 and legacy == 3 and stale == 0,
+          f"unplugged->{gone}, present->{present}, old-style->{legacy}, "
+          f"bad index->{stale}")
+
+    # 14. One definition per helper.
+    import inspect
+    src_eng = inspect.getsource(eng)
+    check("engine helpers are defined once",
+          src_eng.count("def _sink_score(") == 1,
+          f"_sink_score defined {src_eng.count('def _sink_score(')}x")
+
+
 def main():
     print("=" * 68)
     print("Tanin offline harness")
@@ -839,6 +983,7 @@ def main():
     test_broadcast_drift()
     test_meters_and_mute()
     test_presets_and_ir()
+    test_looper_safety()
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)

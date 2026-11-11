@@ -35,7 +35,6 @@ class Recorder:
         self._r = 0
         self._thread = None
         self._stop = threading.Event()
-        self._overruns = 0
 
     def prepare(self, sr: float) -> None:
         self.sr = float(sr)
@@ -54,7 +53,6 @@ class Recorder:
         self.wet_path = os.path.join(self.out_dir, f"{name_hint}-{stamp}.wav")
         self.dry_path = os.path.join(self.out_dir, f"{name_hint}-{stamp}-DI.wav")
         self.frames_written = 0
-        self._overruns = 0
         self.last_error = ""
         self._w = 0
         self._r = 0
