@@ -112,6 +112,6 @@ settings.json       saved devices (by NAME + API, not by index), channel, Stream
 ---
 
 ## Verification snapshot (2026-08-23)
-- Harness: 33/33. Bypass is bit-exact, block-size invariance has 0.0 error, delay timing is sample-accurate, aliasing is −96 dB, the tuner is within 1 cent, DSP load is 8–20%, and Stream Out drift is clean.
+- Harness: 73/73 (33 core checks plus the presets/IR, looper/recorder, meters/tuner-mute and DSP-audit tests). Bypass is bit-exact, block-size invariance has 0.0 error, delay timing is sample-accurate, aliasing is −96 dB, the tuner is within 1 cent, DSP load is 8–20%, and Stream Out drift is clean.
 - Live on ASIO: 0 xruns and 0 callback errors. Looper record, overdub and undo work, and both WAVs write correctly.
 - Two-channel capture confirmed that In 1 and In 2 carry different signals, so the hardware routing is fine.
