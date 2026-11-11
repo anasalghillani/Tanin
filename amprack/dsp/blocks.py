@@ -74,7 +74,22 @@ class Block:
 # ==========================================================================
 
 class NoiseGate(Block):
+    """Hysteresis gate.
+
+    The old gate mapped a 1 ms envelope straight onto gain through a soft
+    knee. A 1 ms envelope ripples at twice the note's frequency, so as a low
+    note decayed through the knee the gain rippled with it (audible flutter)
+    and the gate re-opened on every ripple peak.
+
+    Now: a fast and a slow envelope (the larger wins, so the pick attack is
+    caught in ~0.5 ms but the envelope does not sag between cycles), and a
+    two-threshold switch -- it opens at the threshold and only closes once the
+    envelope falls 8 dB below it. The 0/1 result is then smoothed with the
+    attack and release times, so the close is a clean fade.
+    """
+
     name = "gate"
+    HYSTERESIS_DB = 8.0
 
     def __init__(self):
         super().__init__()
@@ -82,38 +97,48 @@ class NoiseGate(Block):
         self.threshold_db = -55.0
         self.attack_ms = 2.0
         self.release_ms = 120.0
-        self._det = OnePole(3.0)
-        self._smooth = OnePole(10.0)
+        self._det_fast = OnePole(0.5)
+        self._det_slow = OnePole(15.0)
+        self._smooth = OnePole(2.0)
         self._rel = OnePole(120.0)
+        self._open = 0.0
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        for f in (self._det, self._smooth, self._rel):
+        for f in (self._det_fast, self._det_slow, self._smooth, self._rel):
             f.prepare(sr, 1)
-            f.reset()
+        self._idx = np.arange(max_block)
+        self.reset()
 
     def reset(self):
-        for f in (self._det, self._smooth, self._rel):
+        for f in (self._det_fast, self._det_slow, self._smooth, self._rel):
             f.reset()
+        self._open = 0.0
 
     def _process(self, x, n):
-        self._det.set_tau(1.0)
-        env = self._det.process(np.abs(x))
-        thr = db2lin(self.threshold_db)
-        # Soft knee over 6 dB so a decaying note fades rather than chops.
-        lo = thr * 0.5
-        g = np.clip((env - lo) / (thr - lo + 1e-12), 0.0, 1.0)
-        g *= g  # square the curve -> gentler open, faster close
+        rect = np.abs(x)
+        env = np.maximum(self._det_fast.process(rect), self._det_slow.process(rect))
+        thr_open = db2lin(self.threshold_db)
+        thr_close = thr_open * db2lin(-self.HYSTERESIS_DB)
+
+        # Hysteresis, vectorised: mark samples that force open (1) or closed
+        # (0), then carry the last decision forward across the in-between
+        # samples (and across the block boundary via self._open).
+        decided = (env > thr_open) | (env < thr_close)
+        last = np.where(decided, self._idx[:n], -1)
+        np.maximum.accumulate(last, out=last)
+        state = np.where(env > thr_open, 1.0, 0.0)
+        target = np.where(last >= 0, state[np.maximum(last, 0)], self._open)
+        self._open = float(target[-1])
 
         # Asymmetric ballistics without a per-sample branch: run a fast and a
         # slow smoother and take the larger. A rising target is tracked by the
         # fast one (snappy open); a falling target is held up by the slow one
         # (long, natural close). Choosing per block instead would make the
-        # result depend on buffer size, which is a bug you only hear after
-        # someone changes their latency setting.
+        # result depend on buffer size.
         self._smooth.set_tau(self.attack_ms)
         self._rel.set_tau(self.release_ms)
-        gs = np.maximum(self._smooth.process(g), self._rel.process(g))
+        gs = np.maximum(self._smooth.process(target), self._rel.process(target))
         return x * gs
 
 
@@ -210,7 +235,7 @@ class Drive(Block):
         self._tone_lp = Biquad("lowpass", 5500.0, 0.707)
         self._post_lp = Biquad("lowpass", 6000.0, 0.707)
         self._dc = DCBlocker()
-        self._os = Oversampler(factor=4, order=6)
+        self._os = Oversampler()
         self._out = SmoothedParam(1.0)
 
     def prepare(self, sr, max_block):
@@ -244,10 +269,19 @@ class Drive(Block):
         up = self._os.up(pre)
         if shaper_name == "tube":
             shaped = shaper(up, gain, bias)
+        elif bias:
+            # Bias offsets the signal *into* the clipper (in units of the
+            # clipping threshold), so one half-cycle clips earlier than the
+            # other -- that asymmetry is what makes even harmonics. Adding it
+            # after the shaper (the old code) was just DC, which the DC
+            # blocker then removed, so the knob did nothing. The static
+            # offset shaper(bias) is subtracted so engaging the pedal does
+            # not thump.
+            b_in = bias / gain
+            shaped = shaper(up + b_in, gain)
+            shaped -= shaper(np.array([b_in]), gain)[0]
         else:
             shaped = shaper(up, gain)
-            if bias:
-                shaped = shaped + bias * 0.5
         wet = self._os.down(shaped)
         wet = self._dc.process(wet)
 
@@ -275,7 +309,7 @@ class AmpModel:
 
     def __init__(self, name, stages, stage_gain, bias, input_hp, coupling_lp,
                  tone_bass, tone_mid, tone_mid_q, tone_treble, out_lp, gain_range,
-                 shaper="tube"):
+                 shaper="tube", stage_hp=30.0, stage_lp_ratio=1.5):
         self.name = name
         self.stages = stages
         self.stage_gain = stage_gain
@@ -289,25 +323,33 @@ class AmpModel:
         self.out_lp = out_lp
         self.gain_range = gain_range
         self.shaper = shaper
+        # Inter-stage voicing (see Amp.interstage): the coupling-cap highpass
+        # and Miller-capacitance lowpass between gain stages.
+        self.stage_hp = stage_hp
+        self.stage_lp = coupling_lp * stage_lp_ratio
 
 
 AMP_MODELS = {
     "Clean": AmpModel(
         "Clean", stages=2, stage_gain=0.65, bias=0.06, input_hp=45.0,
         coupling_lp=12000.0, tone_bass=95.0, tone_mid=500.0, tone_mid_q=0.6,
-        tone_treble=3200.0, out_lp=9000.0, gain_range=(0.8, 14.0)),
+        tone_treble=3200.0, out_lp=9000.0, gain_range=(0.8, 14.0),
+        stage_hp=20.0),
     "Crunch": AmpModel(
         "Crunch", stages=3, stage_gain=0.8, bias=0.10, input_hp=70.0,
         coupling_lp=9000.0, tone_bass=110.0, tone_mid=650.0, tone_mid_q=0.7,
-        tone_treble=2800.0, out_lp=7000.0, gain_range=(1.5, 60.0)),
+        tone_treble=2800.0, out_lp=7000.0, gain_range=(1.5, 60.0),
+        stage_hp=35.0),
     "Lead": AmpModel(
         "Lead", stages=4, stage_gain=0.95, bias=0.13, input_hp=90.0,
         coupling_lp=7000.0, tone_bass=120.0, tone_mid=750.0, tone_mid_q=0.8,
-        tone_treble=2600.0, out_lp=6200.0, gain_range=(3.0, 220.0)),
+        tone_treble=2600.0, out_lp=6200.0, gain_range=(3.0, 220.0),
+        stage_hp=60.0),
     "Metal": AmpModel(
         "Metal", stages=4, stage_gain=1.05, bias=0.08, input_hp=115.0,
         coupling_lp=6000.0, tone_bass=130.0, tone_mid=800.0, tone_mid_q=1.0,
-        tone_treble=3000.0, out_lp=5600.0, gain_range=(6.0, 600.0)),
+        tone_treble=3000.0, out_lp=5600.0, gain_range=(6.0, 600.0),
+        stage_hp=90.0),
 }
 
 
@@ -315,6 +357,15 @@ class Amp(Block):
     """Cascaded-gain-stage preamp, passive-style tone stack, power-amp sag."""
 
     name = "amp"
+
+    # Inter-stage coupling filters (audit item 12). In a real preamp every
+    # gain stage is followed by a coupling capacitor (a highpass: keeps low
+    # end from piling up and farting out the next stage) and the valve's
+    # Miller capacitance (a lowpass: takes the fizz off before it is clipped
+    # again). They were allocated but never run. True = on, the new voicing;
+    # False = the previous sound, kept so the two can be A/B'd -- see
+    # tools/ab_amp.py. Class-level so flipping Amp.interstage switches all.
+    interstage = True
 
     def __init__(self):
         super().__init__()
@@ -337,7 +388,7 @@ class Amp(Block):
         self._presence = Biquad("highshelf", 5200.0, 0.707)
         self._out_lp = Biquad("lowpass", 7000.0, 0.707)
         self._dc = DCBlocker()
-        self._os = Oversampler(factor=4, order=6)
+        self._os = Oversampler()
         self._sag_env = OnePole(60.0)
         self._master = SmoothedParam(0.5)
         self.output_level = 0.0  # telemetry
@@ -347,10 +398,11 @@ class Amp(Block):
         for f in (self._in_hp, self._bass, self._mid, self._treble,
                   self._presence, self._out_lp):
             f.prepare(sr, 1)
-        for f in self._couple:
-            f.prepare(sr, 1)
-        for f in self._stage_hp:
-            f.prepare(sr, 1)
+        # _couple[0] is the post-preamp lowpass at the base rate; the rest,
+        # and the stage highpasses, live inside the oversampled loop.
+        self._couple[0].prepare(sr, 1)
+        for f in self._couple[1:] + self._stage_hp:
+            f.prepare(sr * self._os.factor, 1)
         self._dc.prepare(sr, 1)
         self._os.prepare(sr, max_block)
         self._sag_env.prepare(sr, 1)
@@ -390,12 +442,18 @@ class Amp(Block):
             sag_gain = 1.0
 
         up = self._os.up(sig)
-        # Coupling filters run at base rate, so the per-stage lowpass is applied
-        # after downsampling in a single pass; inside the oversampled loop we
-        # only shape, which is where the aliasing would come from.
+        inter = self.interstage
         for i in range(m.stages):
             up = shaper(up, per_stage, m.bias * (1.0 if i % 2 == 0 else -0.6))
             up *= 0.85  # inter-stage attenuation, keeps later stages in range
+            if inter and i < m.stages - 1:
+                # Between stages, at the oversampled rate so the lowpass acts
+                # on the harmonics the previous stage just made.
+                hp = self._stage_hp[i]
+                hp.set(f0=m.stage_hp)
+                lp = self._couple[i + 1]
+                lp.set(f0=m.stage_lp)
+                up = lp.process(hp.process(up))
         sig = self._os.down(up)
         sig = self._dc.process(sig)
 
@@ -511,15 +569,48 @@ class Cabinet(Block):
         return self._prox.process(self._tilt.process(sig))
 
 
+class IRKernel:
+    """A ready-to-run impulse response: everything the audio thread needs,
+    already computed and allocated.
+
+    Built by ``IRLoader.build_kernel`` on the control thread. Handing one to
+    ``IRLoader.set_kernel`` is a reference swap, so loading a cab never puts an
+    FFT or an allocation on the audio thread.
+    """
+
+    __slots__ = ("ir", "h_fft", "fft_size", "hist", "max_block")
+
+    def __init__(self, ir: np.ndarray, max_block: int):
+        self.ir = ir
+        self.max_block = int(max_block)
+        size = 1
+        while size < self.max_block + len(ir):
+            size <<= 1
+        self.fft_size = size
+        self.h_fft = np.fft.rfft(ir, size)
+        self.hist = np.zeros(size, dtype=np.float64)
+
+
 class IRLoader(Block):
     """Overlap-save FFT convolution with a user-supplied impulse response.
 
-    The IR is swapped in by the engine's command queue, never here, because
-    changing it reallocates. Latency added is zero: overlap-save keeps the
-    output aligned with the input.
+    The IR is built into an ``IRKernel`` on the control thread and swapped in
+    through the engine's command queue. Latency added is zero: overlap-save
+    keeps the output aligned with the input.
+
+    Level is handled in three places so nothing jumps:
+
+    *   every IR is normalised to the same energy, so swapping cabs does not
+        swap loudness with it (peak normalising let a long, roomy IR come out
+        many dB hotter than a tight one);
+    *   trim and mix are smoothed per sample;
+    *   an IR swap crossfades from the old cab to the new one over one block.
     """
 
     name = "ir"
+
+    MAX_TAPS = 4096          # ~85 ms at 48k: longer than any guitar cab IR needs
+    TARGET_NORM = 1.0        # L2 norm: broadband signals pass at unity power
 
     def __init__(self):
         super().__init__()
@@ -527,61 +618,121 @@ class IRLoader(Block):
         self.mix = 1.0
         self.gain_db = 0.0
         self.ir_path = ""
-        self._h_fft = None
-        self._fft_size = 0
-        self._overlap = None
-        self._ir_len = 0
+        self._kernel: IRKernel | None = None
+        self._fade_from: IRKernel | None = None
+        self._fading = False
+        self._gain = SmoothedParam(1.0)
+        self._mix = SmoothedParam(1.0)
+        self._idx = np.zeros(0)
+        self._fade = np.zeros(0)
+        self._tmp = np.zeros(0)
+
+    @property
+    def has_ir(self) -> bool:
+        return self._kernel is not None
+
+    # -- control thread ----------------------------------------------------
+
+    @classmethod
+    def normalise(cls, ir: np.ndarray) -> np.ndarray:
+        ir = np.asarray(ir, dtype=np.float64).ravel()[: cls.MAX_TAPS]
+        if ir.size == 0 or not np.all(np.isfinite(ir)):
+            raise ValueError("impulse response is empty or not finite")
+        norm = float(np.sqrt(np.sum(ir * ir)))
+        if norm <= 1e-12:
+            raise ValueError("impulse response is silent")
+        return ir * (cls.TARGET_NORM / norm)
+
+    def build_kernel(self, ir: np.ndarray) -> IRKernel:
+        """All the expensive work of loading an IR. Call off the audio thread."""
+        return IRKernel(self.normalise(ir), self.max_block)
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._rebuild()
+        self._gain.prepare(max_block)
+        self._mix.prepare(max_block)
+        self._gain.snap(db2lin(self.gain_db))
+        self._mix.snap(clampf(self.mix, 0.0, 1.0))
+        self._idx = np.arange(1, max_block + 1, dtype=np.float64)
+        self._fade = np.zeros(max_block, dtype=np.float64)
+        self._tmp = np.zeros(max_block, dtype=np.float64)
+        # A new block size needs a new FFT size; prepare() is control-thread.
+        if self._kernel is not None and self._kernel.max_block != self.max_block:
+            self._kernel = IRKernel(self._kernel.ir, self.max_block)
+        self._fade_from = None
+        self._fading = False
+
+    # -- audio thread (command drain) --------------------------------------
+
+    def set_kernel(self, kernel: IRKernel | None, path: str = "") -> None:
+        """Swap the IR in, or out with None. Reference assignments only."""
+        old = self._kernel
+        if kernel is not None and kernel.max_block < self.max_block:
+            # Built for a smaller block than we now run: unusable here, and
+            # rebuilding would mean an FFT on the audio thread. Drop it.
+            return
+        if kernel is not None and old is not None:
+            # Carry the input history across so the new cab starts "warm"
+            # instead of convolving from silence.
+            k = min(len(old.hist), len(kernel.hist))
+            kernel.hist[-k:] = old.hist[-k:]
+        self._kernel = kernel
+        self.ir_path = path if kernel is not None else ""
+        if old is not None and self.enabled:
+            self._fade_from = old
+            self._fading = True
+        if kernel is None and old is None:
+            self.enabled = False
+        elif kernel is not None:
+            self.enabled = True
 
     def set_ir(self, ir: np.ndarray | None, path: str = "") -> None:
-        """Called from the engine command drain, i.e. still on the audio
-        thread but before processing -- so keep it to one allocation and
-        accept it. Called with None to clear."""
-        self.ir_path = path
-        if ir is None or ir.size == 0:
-            self._h_fft = None
-            self.enabled = False
-            return
-        ir = np.asarray(ir, dtype=np.float64).ravel()
-        # 4096 taps is ~85 ms at 48k -- longer than any guitar cab IR needs.
-        ir = ir[:4096]
-        peak = float(np.max(np.abs(ir)))
-        if peak > 0:
-            ir = ir / peak * 0.5
-        self._ir = ir
-        self._rebuild()
-
-    def _rebuild(self):
-        ir = getattr(self, "_ir", None)
-        if ir is None:
-            self._h_fft = None
-            return
-        self._ir_len = len(ir)
-        size = 1
-        while size < self.max_block + self._ir_len:
-            size <<= 1
-        self._fft_size = size
-        self._h_fft = np.fft.rfft(ir, size)
-        self._hist = np.zeros(size, dtype=np.float64)
+        """Convenience for offline use (tests, scripts). Builds the kernel
+        right here, so do not call it from the audio callback."""
+        self.set_kernel(None if ir is None or np.size(ir) == 0
+                        else self.build_kernel(ir), path)
 
     def reset(self):
-        if self._h_fft is not None:
-            self._hist[...] = 0.0
+        for k in (self._kernel, self._fade_from):
+            if k is not None:
+                k.hist[...] = 0.0
+
+    def _convolve(self, k: IRKernel, x: np.ndarray, n: int) -> np.ndarray:
+        # Overlap-save: keep the previous (fft_size - n) input samples.
+        h = k.hist
+        h[:-n] = h[n:]
+        h[-n:] = x
+        return np.fft.irfft(np.fft.rfft(h) * k.h_fft, k.fft_size)[-n:]
 
     def _process(self, x, n):
-        if self._h_fft is None:
+        k = self._kernel
+        old = self._fade_from if self._fading else None
+        if k is None and old is None:
+            if self.ir_path == "" and self.enabled:
+                # Cleared: the fade-out has finished, now really switch off.
+                self.enabled = False
             return x
-        # Overlap-save: keep the previous (fft_size - n) input samples.
-        self._hist[:-n] = self._hist[n:]
-        self._hist[-n:] = x
-        y = np.fft.irfft(np.fft.rfft(self._hist) * self._h_fft, self._fft_size)
-        wet = y[-n:] * db2lin(self.gain_db)
-        if self.mix >= 0.999:
+
+        wet = self._convolve(k, x, n) if k is not None else x.copy()
+        if old is not None:
+            # One-block linear crossfade from the previous IR (or to dry,
+            # when the IR was cleared).
+            prev = self._convolve(old, x, n)
+            fade = self._fade[:n]
+            np.divide(self._idx[:n], n, out=fade)
+            wet *= fade
+            np.subtract(1.0, fade, out=self._tmp[:n])
+            wet += prev * self._tmp[:n]
+            self._fading = False
+            self._fade_from = None
+
+        self._gain.set(db2lin(clampf(self.gain_db, -24.0, 24.0)))
+        wet *= self._gain.ramp(n)
+        self._mix.set(clampf(self.mix, 0.0, 1.0))
+        m = self._mix.ramp(n)
+        if np.isscalar(m) and m >= 0.999:
             return wet
-        return x * (1.0 - self.mix) + wet * self.mix
+        return x * (1.0 - m) + wet * m
 
 
 # ==========================================================================
@@ -631,23 +782,30 @@ class Modulation(Block):
 
     # -- individual modes ---------------------------------------------------
 
-    def _chorus(self, x, n):
+    def _chorus(self, x, n, vibrato=False):
         rate = 0.05 + self.rate * 4.0
         depth_ms = 1.0 + self.depth * 7.0
-        # The shortest excursion must still be at least one block behind the
-        # write head (see DelayLine's ordering contract), so the centre delay
-        # is pushed out at large buffer sizes rather than allowed to alias.
-        min_ms = (n / self.sr) * 1000.0 + 0.5
-        base_ms = max(14.0, min_ms + depth_ms)
+        if vibrato:
+            # Vibrato is 100% wet, so its centre delay is pure latency. Sit it
+            # just past the deepest excursion (depth 0.5: ~4.6 ms) instead of
+            # the chorus' 14 ms.
+            base_ms = depth_ms + 0.1
+        else:
+            base_ms = 14.0
         spread = 0.25 * clampf(self.stereo_spread, 0.0, 1.0)
         ph = self._lfo.phase_block(rate, n)
         l = np.sin(2 * math.pi * ph)
         r = np.sin(2 * math.pi * (ph + spread))
-        dl = (base_ms + depth_ms * l) * 1e-3 * self.sr
-        dr = (base_ms + depth_ms * r) * 1e-3 * self.sr
+        # No feedback here, so write first and read at (delay + n): after the
+        # write the newest input sample is n behind the head. That allows any
+        # delay >= 0 whatever the buffer size. (The old read-then-write order
+        # needed delay >= n, which pushed the chorus centre -- and vibrato's
+        # latency -- out to ~48 ms at a 2048 buffer.)
+        self._line.write(x)
+        dl = (base_ms + depth_ms * l) * 1e-3 * self.sr + n
+        dr = (base_ms + depth_ms * r) * 1e-3 * self.sr + n
         wl = self._line.read_modulated(dl, n)[0]
         wr = self._line.read_modulated(dr, n)[1]
-        self._line.write(x)
         return np.stack((wl, wr))
 
     def _flanger(self, x, n):
@@ -736,7 +894,7 @@ class Modulation(Block):
         if mode == "Chorus":
             wet = self._chorus(x, n)
         elif mode == "Vibrato":
-            return self._chorus(x, n)   # 100% wet: pitch wobble, no comb
+            return self._chorus(x, n, vibrato=True)  # 100% wet: pitch wobble, no comb
         elif mode == "Flanger":
             wet = self._flanger(x, n)
         elif mode == "Phaser":
@@ -867,8 +1025,15 @@ class Reverb(Block):
                           for t in _COMB_TUNING]
         self._ap_len = [[int(t * scale), int((t + _STEREO_SPREAD) * scale)]
                         for t in _ALLPASS_TUNING]
+        # Feedback across a delay shorter than the block cannot be done
+        # block-at-a-time, so both the combs and the allpasses run in chunks
+        # no longer than their shortest delay. That keeps every line at its
+        # true length whatever the driver buffer is (the old code clamped the
+        # combs to the block length, so at 2048 they all collapsed together).
         min_delay = min(min(p) for p in self._ap_len)
         self._chunk = max(16, min(max_block, min_delay - 1))
+        min_comb = min(min(p) for p in self._comb_len)
+        self._comb_chunk = max(16, min(max_block, min_comb))
 
         self._comb_lines = [DelayLine(max(l) + max_block + 8, 2) for l in self._comb_len]
         self._ap_lines = [DelayLine(max(l) + max_block + 8, 2) for l in self._ap_len]
@@ -907,29 +1072,38 @@ class Reverb(Block):
 
         # Pre-delay separates the source from the tail; without it a big reverb
         # smears the pick attack and everything sounds far away.
-        self._pre.write(x)
+        # There is no feedback here, so this is the one place a line may be
+        # written *before* it is read: after the write, the newest input sample
+        # sits n behind the head, so reading at pd + n gives exactly pd -- even
+        # when pd is shorter than the block. (The old code read at pd after
+        # writing, which made every pre-delay one buffer short.)
         pd = int((self.predelay_ms + extra_pre * 20.0) * 1e-3 * self.sr)
-        pd = max(pd, n + 1)
-        src = self._pre.read_fixed(pd, n) * 0.015
+        pd = min(max(pd, 0), int(self.sr * 0.25))
+        self._pre.write(x)
+        src = self._pre.read_fixed(pd + n, n) * 0.015
 
         acc = self._scratch[:, :n]
         acc[...] = 0.0
 
-        # Parallel comb filters -> the tail's density.
-        for i, dl in enumerate(self._comb_lines):
-            dL = max(self._comb_len[i][0], n + 1)
-            dR = max(self._comb_len[i][1], n + 1)
-            outL = dl.read_fixed(dL, n)[0]
-            outR = dl.read_fixed(dR, n)[1]
-            out = np.stack((outL, outR))
-            f = self._comb_damp[i]
+        # Parallel comb filters -> the tail's density. Chunked so each comb
+        # keeps its own length (see prepare()).
+        for i, f in enumerate(self._comb_damp):
             # Damping is a one-pole lowpass inside the feedback path: high
             # frequencies die away faster than lows, as in a real room.
             f.b[0] = 1.0 - damp
             f.a[1] = -damp
-            filt = f.process(out)
-            dl.write(src + filt * room)
-            acc += out
+        cc = self._comb_chunk
+        pos = 0
+        while pos < n:
+            k = min(cc, n - pos)
+            s_seg = src[:, pos:pos + k]
+            for i, dl in enumerate(self._comb_lines):
+                dL, dR = self._comb_len[i]
+                out = np.stack((dl.read_fixed(dL, k)[0], dl.read_fixed(dR, k)[1]))
+                filt = self._comb_damp[i].process(out)
+                dl.write(s_seg + filt * room)
+                acc[:, pos:pos + k] += out
+            pos += k
 
         acc *= 0.25
 
@@ -980,14 +1154,14 @@ class Output(Block):
         self.peak_l = 0.0
         self.peak_r = 0.0
         self._g = SmoothedParam(db2lin(-6.0))
-        self._limiter_env = OnePole(30.0)
+        self._limiter_env = OnePole(60.0)
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
         self._g.prepare(max_block)
         self._g.snap(db2lin(self.volume_db))
         self._limiter_env.prepare(sr, 1)
-        self._limiter_env.reset()
+        self._limiter_env.reset(1.0)
 
     def _process(self, x, n):
         w = clampf(self.width, 0.0, 2.0)
@@ -1000,12 +1174,21 @@ class Output(Block):
 
         # Brick-wall safety limiter. Not a tone control -- it exists so a
         # runaway feedback loop cannot blow up headphones.
+        # Instant attack: the gain each sample needs is computed directly, so
+        # the very first loud sample is already held at the ceiling (the old
+        # 30 ms smoothed envelope let a sudden spike through at full level for
+        # tens of milliseconds). Release: that gain also goes through a 60 ms
+        # one-pole and we take the smaller of the two -- falling gain follows
+        # the instant one, rising gain follows the slow one. Same trick as the
+        # gate, and block-size invariant because the filter runs every block.
         peak = np.max(np.abs(y), axis=0)
-        env = self._limiter_env.process(peak)
-        over = env > 0.95
-        if np.any(over):
-            g = np.ones(n)
-            g[over] = 0.95 / env[over]
+        need = np.minimum(1.0, 0.95 / np.maximum(peak, 1e-12))
+        slow = self._limiter_env.process(need)
+        g = np.minimum(need, slow)
+        # Snap the last millionth of release to exactly 1 so a signal below the
+        # ceiling passes bit-for-bit untouched (a -120 dB step, inaudible).
+        g[g > 1.0 - 1e-6] = 1.0
+        if np.any(g < 1.0):
             y = y * g
 
         self.peak_l = float(np.max(np.abs(y[0]))) if n else 0.0

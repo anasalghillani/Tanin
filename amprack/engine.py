@@ -18,7 +18,6 @@ from __future__ import annotations
 import gc
 import math
 import os
-import threading
 import time
 from collections import deque
 
@@ -269,6 +268,7 @@ class Engine:
     def __init__(self, recordings_dir: str):
         self.chain = Chain()
         self.looper = Looper()
+        self.looper.post = self.post   # loop buttons land between blocks
         self.recorder = Recorder(recordings_dir)
         self.metronome = Metronome()
         self.broadcast = BroadcastOut()
@@ -288,6 +288,22 @@ class Engine:
         self.exclusive_fallback = False
         self.channel_peaks = np.zeros(16, dtype=np.float64)
         self.n_input_channels = 1
+        # Meters: the callback runs ~190x/s, the UI ~30x/s, so peaks are
+        # accumulated per block and handed over on request (see read_meters).
+        self.out_peaks = np.zeros(2, dtype=np.float64)
+        self.in_clips = 0             # blocks where the guitar input hit full scale
+        self.out_clips = 0            # blocks the final hard clip had to cut
+        self.output_muted = False     # tuner mute: silence out, keep metering
+        self._meter_take = False
+        self._in_acc = np.zeros(16, dtype=np.float32)
+        self._in_blk = np.zeros(16, dtype=np.float32)
+        self._out_acc = np.zeros(2, dtype=np.float64)
+        self._out_blk = np.zeros(2, dtype=np.float64)
+        self._abs_in = np.zeros((0, 8), dtype=np.float32)
+        self._abs_out = np.zeros((2, 0), dtype=np.float64)
+        self._mute_gain = 1.0
+        self._ramp = np.zeros(0, dtype=np.float64)
+        self._gain_buf = np.zeros(0, dtype=np.float64)
 
         self.stream: sd.Stream | None = None
         self.running = False
@@ -301,7 +317,6 @@ class Engine:
         self.stream_latency_ms = 0.0
 
         self._commands: deque = deque()
-        self._lock = threading.Lock()
         self._mono_in = np.zeros(0, dtype=np.float64)
         self._deadline = 1.0
 
@@ -312,27 +327,88 @@ class Engine:
 
         For anything that would resize or swap a buffer. deque.append and
         popleft are atomic in CPython, so this needs no lock.
+
+        With no stream running there is no audio thread to race and no block
+        to wait for, so it runs right away. Queuing it instead would leave it
+        sitting there until the next start, which used to throw it away.
         """
-        self._commands.append(fn)
+        if self.running and self.stream is not None:
+            self._commands.append(fn)
+        else:
+            fn()
+
+    def _drain_commands(self) -> None:
+        """Run everything still queued. Control thread, stream not running."""
+        while True:
+            try:
+                fn = self._commands.popleft()
+            except IndexError:
+                return
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                self.last_callback_exc = repr(exc)
+
+    def _read_ir(self, path: str):
+        """Read, resample and FFT an IR file. Control thread only."""
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float64", always_2d=True)
+        ir = data[:, 0]
+        if abs(sr - self.samplerate) > 1:
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(int(sr), int(self.samplerate))
+            ir = resample_poly(ir, int(self.samplerate) // g, int(sr) // g)
+        return self.chain["ir"].build_kernel(ir)
 
     def load_ir(self, path: str) -> str:
-        """Read the IR here, on the control thread, then swap it in."""
+        """Read the IR and do all its maths here, on the control thread; the
+        audio thread only swaps a reference."""
         try:
-            import soundfile as sf
-            data, sr = sf.read(path, dtype="float64", always_2d=True)
-            ir = data[:, 0]
-            if abs(sr - self.samplerate) > 1:
-                from scipy.signal import resample_poly
-                from math import gcd
-                g = gcd(int(sr), int(self.samplerate))
-                ir = resample_poly(ir, int(self.samplerate) // g, int(sr) // g)
-            self.post(lambda: self.chain["ir"].set_ir(ir, path))
-            return ""
+            kernel = self._read_ir(path)
         except Exception as exc:  # noqa: BLE001
             return f"{type(exc).__name__}: {exc}"
+        self.post(lambda: self.chain["ir"].set_kernel(kernel, path))
+        return ""
 
     def clear_ir(self) -> None:
-        self.post(lambda: self.chain["ir"].set_ir(None, ""))
+        self.post(lambda: self.chain["ir"].set_kernel(None, ""))
+
+    def apply_preset(self, state: dict) -> str:
+        """Load a whole preset, including its IR file. Returns '' or an error.
+
+        The IR file is read here (file I/O is banned on the audio thread), then
+        the IR swap and every knob land together in one queued command, so the
+        new sound starts on a block boundary instead of in pieces. If the IR
+        file can't be read, the rest of the preset still loads, the IR block
+        is switched off, and the error comes back for the UI to show.
+        """
+        ir_state = state.get("ir") if isinstance(state, dict) else None
+        path = ir_state.get("ir_path", "") if isinstance(ir_state, dict) else ""
+        path = path if isinstance(path, str) else ""
+        blk = self.chain["ir"]
+        err = ""
+        kernel = None
+        keep = bool(path) and path == blk.ir_path and blk.has_ir
+        if path and not keep:
+            if not os.path.isfile(path):
+                err = f"IR file not found: {path}"
+            else:
+                try:
+                    kernel = self._read_ir(path)
+                except Exception as exc:  # noqa: BLE001
+                    err = f"Could not load IR {os.path.basename(path)}: " \
+                          f"{type(exc).__name__}: {exc}"
+
+        def swap():
+            if not keep:
+                blk.set_kernel(kernel, path if kernel is not None else "")
+            self.chain.apply(state)
+            if not blk.has_ir:
+                blk.enabled = False
+
+        self.post(swap)
+        return err
 
     # -- stream lifecycle --------------------------------------------------
 
@@ -483,6 +559,14 @@ class Engine:
                 s.close()
             except Exception:
                 pass
+        # Anything queued for a block that never came (a preset clicked just
+        # as the stream went down) still has to land.
+        self._drain_commands()
+        # A take cannot outlive its stream: with no callback feeding the ring
+        # the file would just stop growing while the UI still says
+        # "recording", and the next start() would resize the ring under the
+        # writer thread. Stopped after the stream so the last block is kept.
+        self.recorder.stop()
         if not gc.isenabled():
             gc.enable()
             gc.unfreeze()
@@ -492,25 +576,38 @@ class Engine:
 
     def _prepare(self) -> None:
         dev = sd.query_devices(self.input_device)
-        self._in_channels = max(1, min(int(dev["max_input_channels"]), 8))
+        self._prepare_buffers(int(dev["max_input_channels"]))
+
+    def _prepare_buffers(self, max_in_channels: int) -> None:
+        self._in_channels = max(1, min(int(max_in_channels), 8))
         if self.input_channel >= self._in_channels:
             self.input_channel = 0
         sr = float(self.samplerate)
         n = int(self.active_blocksize)
+        # Was a clear() further down, which silently dropped preset and IR
+        # changes made while stopped. Run them instead (no stream yet, so no
+        # race), and before prepare() so it sizes whatever they swapped in.
+        self._drain_commands()
         self.chain.prepare(sr, n)
         self.looper.prepare(sr, n)
         self.recorder.prepare(sr)
         self.metronome.prepare(sr)
         self._mono_in = np.zeros(n, dtype=np.float64)
-        self._silence = np.zeros(n, dtype=np.float64)
         self._deadline = n / sr
         self.xruns = 0
         self.callback_errors = 0
         self.blocks_processed = 0
         self.peak_load = 0.0
         self.channel_peaks[...] = 0.0
+        self.out_peaks[...] = 0.0
+        self._in_acc[...] = 0.0
+        self._out_acc[...] = 0.0
+        self._abs_in = np.zeros((n, 8), dtype=np.float32)
+        self._abs_out = np.zeros((2, n), dtype=np.float64)
+        self._ramp = np.arange(1, n + 1, dtype=np.float64) / n
+        self._gain_buf = np.zeros(n, dtype=np.float64)
+        self._mute_gain = 0.0 if self.output_muted else 1.0
         self.n_input_channels = self._in_channels
-        self._commands.clear()
 
     # -- the callback ------------------------------------------------------
 
@@ -539,16 +636,23 @@ class Engine:
                 outdata[:] = 0.0
                 return
 
-            nch = indata.shape[1]
+            nch = min(indata.shape[1], 8)
             # Meter every hardware input, not just the selected one. Picking
             # the right jack is guesswork otherwise -- the channel that moves
-            # when you play is the answer.
-            self.channel_peaks[:nch] = np.max(np.abs(indata), axis=0)
+            # when you play is the answer. Peaks accumulate across blocks
+            # into preallocated arrays: no allocation, no lock.
+            a = self._abs_in[:n, :nch]
+            np.abs(indata[:, :nch], out=a)
+            blk = self._in_blk[:nch]
+            np.max(a, axis=0, out=blk)
+            np.maximum(self._in_acc[:nch], blk, out=self._in_acc[:nch])
             self.n_input_channels = nch
 
             ch = self.input_channel
             if ch >= nch:
                 ch = 0
+            if blk[ch] >= 0.999:
+                self.in_clips += 1
             mono = indata[:, ch].astype(np.float64)
             self.input_ring.push(indata[:, ch], n)
 
@@ -560,14 +664,26 @@ class Engine:
 
             wet = self.looper.process(wet, n)
             self.metronome.render(wet, n)
+            # Tuner mute goes before the recorder and Stream Out, so nobody
+            # (you, the take, or Discord) hears the tuning.
+            if self.output_muted or self._mute_gain < 1.0:
+                self._apply_mute(wet, n)
             self.recorder.push(wet, mono, n)
             self.broadcast.push(wet, n)
 
             np.nan_to_num(wet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            # Measure before the hard clip, or clipping could never show.
+            ao = self._abs_out[:, :n]
+            np.abs(wet, out=ao)
+            np.max(ao, axis=1, out=self._out_blk)
+            np.maximum(self._out_acc, self._out_blk, out=self._out_acc)
+            if self._out_blk[0] > 1.0 or self._out_blk[1] > 1.0:
+                self.out_clips += 1
             np.clip(wet, -1.0, 1.0, out=wet)
             outdata[:, 0] = wet[0]
             outdata[:, 1] = wet[1]
             self.blocks_processed += 1
+            self._publish_meters()
 
         except Exception as exc:  # noqa: BLE001
             # Nothing here may propagate: PortAudio would abort the stream and
@@ -582,6 +698,40 @@ class Engine:
                 self.peak_load = self.load
 
     # -- helpers for the UI ------------------------------------------------
+
+    def _apply_mute(self, wet: np.ndarray, n: int) -> None:
+        """Tuner mute with a one-block ramp so it never clicks."""
+        target = 0.0 if self.output_muted else 1.0
+        g0 = self._mute_gain
+        if g0 == target:
+            if target == 0.0:
+                wet[...] = 0.0
+            return
+        g = self._gain_buf[:n]
+        np.multiply(self._ramp[:n], target - g0, out=g)
+        g += g0
+        wet *= g
+        self._mute_gain = target
+
+    def _publish_meters(self) -> None:
+        """Callback side of read_meters(): hand over and restart the peaks."""
+        if self._meter_take:
+            self.channel_peaks[:8] = self._in_acc[:8]
+            self.out_peaks[:] = self._out_acc
+            self._in_acc[...] = 0.0
+            self._out_acc[...] = 0.0
+            self._meter_take = False
+
+    def read_meters(self) -> tuple[np.ndarray, np.ndarray]:
+        """UI side: peaks gathered since the previous read, per channel.
+
+        The callback is the only writer of the peak arrays. This just raises
+        a flag; the callback copies its running maximum out and restarts it
+        at the end of its next block. Every block lands in exactly one read,
+        and neither side ever waits for the other.
+        """
+        self._meter_take = True
+        return self.channel_peaks, self.out_peaks
 
     def reset_meters(self) -> None:
         self.peak_load = 0.0
@@ -707,22 +857,6 @@ def broadcast_candidates(monitor_device: int | None) -> list[dict]:
     return out
 
 
-def _sink_score(name: str) -> int:
-    """Lower is safer to send audio into without hearing it.
-
-    'NVIDIA Broadcast' is deliberately *not* treated as silent: it is a
-    processing endpoint that forwards to a real output, so it usually is
-    audible despite looking virtual.
-    """
-    n = name.lower()
-    if "steam streaming" in n:
-        return 0
-    if any(k in n for k in ("cable", "voicemeeter", "vb-audio", "vdvad",
-                            "vad ", "_vad", "virtual")):
-        return 1
-    return 2
-
-
 def suggest_broadcast_device(monitor_device: int | None) -> int | None:
     cands = broadcast_candidates(monitor_device)
     return cands[0]["index"] if cands else None
@@ -747,6 +881,25 @@ def find_device(name: str, api: str, kind: str) -> int | None:
         if d["name"] == name:
             return d["index"]
     return None
+
+
+def resolve_device(name: str, api: str, kind: str,
+                   index_hint: int | None, default: int | None) -> int | None:
+    """Turn a saved device back into a live index, or fall back to `default`.
+
+    When a name was saved, only that name counts: if the interface is
+    unplugged the old index now belongs to some other device, and opening it
+    would silently play through the wrong hardware. The bare index is only
+    trusted for settings written before names were saved, and only if it
+    still exists.
+    """
+    if name:
+        found = find_device(name, api, kind)
+        return found if found is not None else default
+    if index_hint is not None and any(
+            d["index"] == index_hint for d in list_devices(kind)):
+        return index_hint
+    return default
 
 
 def list_devices(kind: str) -> list[dict]:

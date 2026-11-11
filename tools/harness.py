@@ -469,32 +469,10 @@ def test_tuner():
 
 
 # --------------------------------------------------------------------------
-# 9. Distortion aliasing -- the reason for the oversampler
+# 9. Distortion aliasing -- moved to tools/dsp_tests.py (test_aliasing_real).
+#    The old version used a 2 kHz tone, which divides 48 kHz exactly, so every
+#    folded harmonic landed on a real one and the test could not see aliasing.
 # --------------------------------------------------------------------------
-
-def test_aliasing():
-    print("\n[9] distortion aliasing")
-    # A 2 kHz sine into a high-gain amp. Harmonics land at 4, 6, 8 kHz...
-    # Anything appearing at a non-multiple of 2 kHz is folded aliasing.
-    x = sine(2000.0, 1.0, 0.4)
-    c = Chain()
-    c.prepare(SR, 256)
-    c["amp"].model = "Metal"
-    c["amp"].gain = 0.95
-    c["cab"].enabled = False
-    y = run_blocks(c, x, 256)[0]
-    seg = y[-32768:] * np.hanning(32768)
-    spec = np.abs(np.fft.rfft(seg))
-    freqs = np.fft.rfftfreq(32768, 1 / SR)
-    harmonic = np.zeros(len(freqs), dtype=bool)
-    for k in range(1, 12):
-        harmonic |= np.abs(freqs - 2000.0 * k) < 60.0
-    harmonic |= freqs < 120.0
-    total = float(np.sum(spec[harmonic] ** 2))
-    alias = float(np.sum(spec[~harmonic] ** 2))
-    ratio_db = 10 * math.log10(alias / max(total, 1e-20))
-    check("aliasing at least 30 dB below the harmonic series", ratio_db < -30.0,
-          f"alias/harmonic = {ratio_db:.1f} dB")
 
 
 # --------------------------------------------------------------------------
@@ -558,6 +536,411 @@ def test_broadcast_drift():
           "; ".join(worst) if worst else "no underruns, fill stayed in band")
 
 
+def test_meters_and_mute():
+    """Meters must show every peak, not just the block the UI happened to see.
+
+    The UI redraws ~30 times a second; at a 256-sample buffer the callback
+    runs ~190 times a second, so a meter that shows only the latest block
+    misses five blocks in six.
+    """
+    print("\n[meters] peak capture, clip lights, tuner mute")
+    import tempfile
+    from amprack.engine import Engine
+
+    n = 256
+    e = Engine(tempfile.mkdtemp())
+    e.samplerate = 48000
+    e.active_blocksize = n
+    e._prepare_buffers(2)
+    out = np.zeros((n, 2), dtype=np.float32)
+
+    def block(a0=0.01, a1=0.01, spike0=0.0):
+        x = np.zeros((n, 2), dtype=np.float32)
+        x[:, 0] = a0 * np.sin(np.arange(n) * 0.05)
+        x[:, 1] = a1 * np.sin(np.arange(n) * 0.07)
+        if spike0:
+            x[n // 3, 0] = spike0
+        e._callback(x, out, n, None, None)
+
+    # One spike in the middle of many blocks between two UI reads.
+    for i in range(40):
+        block(spike0=0.9 if i == 20 else 0.0)
+    e.read_meters()
+    block()                      # the callback publishes on its next block
+    pk_in, _ = e.read_meters()
+    check("input meter catches a single-block peak between UI reads",
+          abs(float(pk_in[0]) - 0.9) < 1e-6, f"shown {float(pk_in[0]):.3f}, real 0.900")
+
+    # Reads interleaved with spikes: no spike may fall between the cracks.
+    spikes = [round(0.1 + 0.05 * k, 2) for k in range(16)]
+    seen = []
+    for i in range(160):
+        block(spike0=spikes[i // 10] if i % 10 == 4 else 0.0)
+        if i % 3 == 2:
+            seen.append(round(float(e.read_meters()[0][0]), 2))
+    block()
+    seen.append(round(float(e.read_meters()[0][0]), 2))
+    missed = [s for s in spikes if s not in seen]
+    check("no peak lost when the UI reads mid-stream", not missed,
+          f"missed {missed}" if missed else f"all {len(spikes)} spikes shown")
+
+    # Clip light: selected input hitting full scale; ch2 clipping is ignored.
+    c0 = e.in_clips
+    block(spike0=1.0)
+    block(a1=1.0)
+    check("input clip counted on the guitar channel only", e.in_clips - c0 == 1,
+          f"{e.in_clips - c0} clip events")
+
+    ch = e.chain
+    ch.global_bypass = True
+    ch.input_gain_db = 24.0
+    o0 = e.out_clips
+    for _ in range(8):
+        block(a0=0.5)
+    check("output clip detected before the final hard clip", e.out_clips > o0,
+          f"{e.out_clips - o0} clipped blocks")
+
+    # Tuner mute: silent output, tuner still hears the guitar.
+    ch.input_gain_db = 0.0
+    e.output_muted = True
+    for _ in range(4):
+        block(a0=0.5)
+    muted_out = float(np.max(np.abs(out)))
+    ring = float(np.max(np.abs(e.input_ring.snapshot(n))))
+    e.output_muted = False
+    for _ in range(4):
+        block(a0=0.5)
+    back = float(np.max(np.abs(out)))
+    check("tuner mute silences output but keeps feeding the tuner",
+          muted_out == 0.0 and ring > 0.4 and back > 0.4 and e.callback_errors == 0,
+          f"muted {muted_out:.4f}, tuner input {ring:.2f}, unmuted {back:.2f}, "
+          f"errors {e.callback_errors} {e.last_callback_exc}")
+    ch.global_bypass = False
+
+
+# --------------------------------------------------------------------------
+# 12. Presets and the IR loader -- state that must survive the control path
+# --------------------------------------------------------------------------
+
+class _FakeStream:
+    """Stands in for a running sounddevice stream: Engine only stops it."""
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _write_wav(path: str, data: np.ndarray, sr: int = 48000) -> None:
+    import soundfile as sf
+    sf.write(path, data.astype(np.float32), sr)
+
+
+def test_presets_and_ir():
+    print("\n[12] presets and IR loader")
+    import tempfile
+
+    from amprack import presets as presetlib
+    from amprack.engine import Engine
+
+    tmp = tempfile.mkdtemp(prefix="tanin-harness-")
+
+    # (a) a preset that leaves a block out must not inherit the last preset's
+    #     settings for it: loading B after A has to sound like loading B.
+    a = presetlib.FACTORY["Metal Chug"]      # gate on, drive on, Plate reverb
+    b = presetlib.FACTORY["Clean Chime"]     # says nothing about the gate
+    after_a = Chain()
+    after_a.apply(a)
+    after_a.apply(b)
+    fresh = Chain()
+    fresh.apply(b)
+    sa, sf_ = after_a.snapshot(), fresh.snapshot()
+    diff = [f"{k}.{nm}" for k in Chain.PARAM_SPEC for nm in Chain.PARAM_SPEC[k]
+            if sa[k][nm] != sf_[k][nm]]
+    check("preset B after preset A equals preset B alone", not diff,
+          "bleeds: " + ", ".join(diff[:6]) if diff else "no carry-over")
+
+    # (b) junk in a preset file must not reach the audio thread as junk.
+    c = Chain()
+    c.apply({"amp": {"gain": "loud", "master": float("nan")},
+             "reverb": {"enabled": "yes please"}, "gate": "not a dict"})
+    ok = isinstance(c["amp"].gain, float) and math.isfinite(c["amp"].master) \
+        and isinstance(c["reverb"].enabled, bool)
+    check("malformed preset values fall back to defaults", ok,
+          f"gain={c['amp'].gain!r} master={c['amp'].master!r} "
+          f"reverb.enabled={c['reverb'].enabled!r}")
+
+    # (c) a preset or IR change made while audio is stopped must stick.
+    e = Engine(os.path.join(tmp, "rec"))
+    e.post(lambda: e.chain.apply(presetlib.FACTORY["Ambient Wash"]))
+    check("preset picked while stopped is applied",
+          e.chain["reverb"].mode == "Cathedral",
+          f"reverb mode {e.chain['reverb'].mode!r}")
+    #     ...and one queued just before the stream stops is not dropped.
+    e.running, e.stream = True, _FakeStream()
+    e.post(lambda: e.chain.apply(presetlib.FACTORY["Surf Twang"]))
+    e.stop()
+    check("command queued as the stream stops still lands",
+          e.chain["mod"].mode == "Tremolo" and not e._commands,
+          f"mod mode {e.chain['mod'].mode!r}, {len(e._commands)} left queued")
+
+    # (d) presets carry their IR file: loading one loads the IR, loading one
+    #     without an IR clears it.
+    rng = np.random.default_rng(3)
+    ir_a = np.exp(-np.arange(1500) / 300.0) * rng.standard_normal(1500)
+    ir_b = np.zeros(64)
+    ir_b[0] = 1.0
+    path_a = os.path.join(tmp, "cab_a.wav")
+    path_b = os.path.join(tmp, "cab_b.wav")
+    _write_wav(path_a, ir_a)
+    _write_wav(path_b, ir_b)
+
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    st = Chain().snapshot()
+    st["ir"].update(enabled=True, ir_path=path_a)
+    err = e.apply_preset(st)
+    irb = e.chain["ir"]
+    check("preset with an IR file loads that IR",
+          not err and irb.enabled and irb.ir_path == path_a and irb.has_ir,
+          err or f"enabled={irb.enabled} path={os.path.basename(irb.ir_path)!r}")
+    err = e.apply_preset(presetlib.FACTORY["Clean Chime"])
+    check("preset without an IR clears the previous one",
+          not err and not irb.enabled and irb.ir_path == "" and not irb.has_ir,
+          f"enabled={irb.enabled} path={irb.ir_path!r}")
+    st["ir"]["ir_path"] = os.path.join(tmp, "missing.wav")
+    err = e.apply_preset(st)
+    check("missing IR file is reported, not silently half-loaded",
+          bool(err) and not irb.enabled and e.chain["amp"].model == st["amp"]["model"],
+          err or "no error returned")
+
+    # (e) the IR maths runs on the control thread. Only a reference swap may
+    #     reach the audio thread's command queue.
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    e.running, e.stream = True, _FakeStream()     # pretend a stream is up
+    calls = {"n": 0}
+    real_rfft = np.fft.rfft
+
+    def counting_rfft(*args, **kw):
+        calls["n"] += 1
+        return real_rfft(*args, **kw)
+
+    err = e.load_ir(path_a)
+    np.fft.rfft = counting_rfft
+    try:
+        while e._commands:
+            e._commands.popleft()()
+    finally:
+        np.fft.rfft = real_rfft
+    e.running, e.stream = False, None
+    check("IR load does no FFT on the audio thread",
+          not err and calls["n"] == 0 and e.chain["ir"].has_ir,
+          err or f"{calls['n']} rfft call(s) in the drained command")
+
+    # (f) level: two very different IRs land at a similar loudness, and
+    #     neither a trim move nor an IR swap steps the output.
+    def ir_rms(path):
+        en = Engine(os.path.join(tmp, "rec"))
+        en.chain.prepare(SR, 256)
+        en.load_ir(path)
+        blk = en.chain["ir"]
+        noise = np.random.default_rng(5).standard_normal(int(SR)) * 0.1
+        out = np.concatenate([blk.process(noise[i:i + 256].copy())
+                              for i in range(0, len(noise) - 255, 256)])
+        return float(np.sqrt(np.mean(out[int(SR * 0.2):] ** 2)))
+
+    ra, rb = ir_rms(path_a), ir_rms(path_b)
+    gap = abs(20 * math.log10(ra / rb))
+    check("different IRs load at a matched level", gap < 1.5,
+          f"level gap {gap:.1f} dB")
+
+    e = Engine(os.path.join(tmp, "rec"))
+    e.chain.prepare(SR, 256)
+    e.load_ir(path_b)
+    blk = e.chain["ir"]
+    x = sine(220.0, 1.5, 0.3)
+    out = np.zeros(len(x))
+    for k, i in enumerate(range(0, len(x) - 255, 256)):
+        if k == 60:
+            blk.gain_db = 12.0                   # trim jumps 12 dB in one go
+        if k == 120:
+            e.load_ir(path_a)                    # swap the cab mid-note
+        out[i:i + 256] = blk.process(x[i:i + 256].copy())
+    n = (len(x) // 256) * 256
+    step = _max_step(out[:n])
+    # The yardstick is the sine's own slope in the loudest steady stretch on
+    # either side of the swap; a click is a step well above that.
+    natural = max(_max_step(out[70 * 256:118 * 256]), _max_step(out[130 * 256:n]))
+    check("IR trim move and IR swap do not click",
+          np.all(np.isfinite(out)) and step <= natural * 1.25,
+          f"max sample step {step:.4f} vs steady {natural:.4f}")
+
+    # (g) preset names end up as file names: refuse anything that could
+    #     escape the folder or that Windows will not create.
+    bad = ["", "   ", "../evil", "a/b", "a\\b", "CON", "nul", "com1.json",
+           "x:y", "what?", "name.", "tab\there", "x" * 100]
+    good = ["Clean Chime", "Lead #2", "طنين نظيف", "Ambient (wet)"]
+    slipped = [repr(nm) for nm in bad if not presetlib.validate_name(nm)]
+    refused = [repr(nm) for nm in good if presetlib.validate_name(nm)]
+    check("unsafe preset names are refused, normal ones accepted",
+          not slipped and not refused,
+          f"accepted {slipped} refused {refused}" if slipped or refused
+          else f"{len(bad)} refused, {len(good)} accepted")
+    pdir = os.path.join(tmp, "presets")
+    try:
+        presetlib.save_preset(pdir, "../escaped", {"amp": {}})
+        raised = False
+    except ValueError:
+        raised = True
+    check("save_preset will not write outside the preset folder",
+          raised and not os.path.exists(os.path.join(tmp, "escaped.json")),
+          "raised ValueError" if raised else "wrote it")
+
+
+# --------------------------------------------------------------------------
+# 13. Looper, recorder and device bookkeeping
+# --------------------------------------------------------------------------
+
+def _record_loop(lp: Looper, seconds: float = 1.0, block: int = 256) -> float:
+    """Record a pluck into an empty looper and close it. Returns its rms."""
+    src = pluck(220.0, seconds, 0.5)
+    src = np.stack((src, src))
+    lp.record()
+    for i in range(0, (src.shape[1] // block) * block, block):
+        lp.process(src[:, i:i + block].copy(), block)
+    lp.play()
+    return _loop_rms(lp, block)
+
+
+def _loop_rms(lp: Looper, block: int = 256) -> float:
+    if lp.length <= 0 or lp.state not in ("playing", "overdubbing"):
+        return 0.0
+    keep = lp.pos
+    lp.pos = 0.0
+    got = np.zeros((2, lp.length))
+    silence = np.zeros((2, block))
+    for i in range(0, lp.length - block, block):
+        got[:, i:i + block] = lp.process(silence.copy(), block)
+    lp.pos = keep
+    return float(np.sqrt(np.mean(got ** 2)))
+
+
+def test_looper_safety():
+    print("\n[13] looper / recorder / devices")
+    block = 256
+
+    # 9. Clear must be undoable: one stray press of "C" should not cost a take.
+    lp = Looper(max_seconds=10.0)
+    lp.prepare(SR, block)
+    before = _record_loop(lp)
+    lp.clear()
+    cleared = lp.state == "empty" and lp.length == 0
+    ok = lp.undo()
+    lp.play()
+    after = _loop_rms(lp)
+    check("undo brings back a cleared loop",
+          cleared and ok and before > 0.01
+          and abs(after - before) / before < 0.02,
+          f"rms {before:.4f} -> clear -> undo -> {after:.4f}")
+
+    # Recording a new loop after a clear must not destroy the old one either.
+    lp.clear()
+    _record_loop(lp, 0.5)
+    new_len = lp.length
+    lp.undo()
+    lp.play()
+    back = _loop_rms(lp)
+    check("undo after re-recording swaps the cleared loop back",
+          abs(back - before) / before < 0.02 and lp.length != new_len,
+          f"rms {back:.4f} (target {before:.4f})")
+
+    # 10a. Restarting audio (same rate) must keep the loop and its undo.
+    lp = Looper(max_seconds=10.0)
+    lp.prepare(SR, block)
+    before = _record_loop(lp)
+    lp.prepare(SR, 512)
+    after = _loop_rms(lp)
+    check("audio restart keeps the loop",
+          lp.state == "playing" and abs(after - before) / before < 0.02,
+          f"state {lp.state}, rms {before:.4f} -> {after:.4f}")
+
+    # 10b. With an engine attached, looper buttons only queue work; the
+    # change lands at the top of the next audio block, never mid-block.
+    from amprack.engine import Engine
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="tanin-harness-")
+    e = Engine(tmp)
+    # Same setup start() does, so the callback's work buffers exist.
+    e.samplerate = SR
+    e.active_blocksize = block
+    e._prepare_buffers(1)
+    indata = np.zeros((block, 1), dtype=np.float32)
+    outdata = np.zeros((block, 2), dtype=np.float32)
+    class _LiveStream:        # stands in for an open stream
+        def stop(self): pass
+        def close(self): pass
+    e.stream = _LiveStream()
+    e.running = True
+    e.looper.toggle()
+    queued = e.looper.state == "empty" and len(e._commands) == 1
+    e._callback(indata, outdata, block, None, None)
+    check("looper buttons go through the engine queue",
+          queued and e.looper.state == "recording" and e.callback_errors == 0,
+          f"before block: queued={queued}; after block: {e.looper.state}")
+
+    # 17. Stopping audio must also end a recording, and the file must hold
+    # what was captured.
+    import soundfile as sf
+    e.recorder.start("harness")
+    tone = np.sin(2 * np.pi * 440 * np.arange(block) / SR).astype(np.float32)
+    indata[:, 0] = tone * 0.3
+    for _ in range(40):
+        e._callback(indata, outdata, block, None, None)
+    e.stop()
+    frames = 0
+    try:
+        frames = sf.info(e.recorder.wet_path).frames
+    except Exception:
+        pass
+    check("stopping audio stops the recorder and keeps the take",
+          not e.recorder.recording and frames == 40 * block,
+          f"recording={e.recorder.recording}, {frames} frames saved")
+
+    # 15. A saved device that is no longer plugged in must fall back to the
+    # default, not to whatever now sits at the old index.
+    import amprack.engine as eng
+    fake = [
+        {"index": 0, "name": "Microphone (Realtek)", "api": "Windows WASAPI",
+         "channels": 2, "default_sr": 48000, "rank": 1},
+        {"index": 3, "name": "Line In (Webcam)", "api": "Windows WASAPI",
+         "channels": 1, "default_sr": 48000, "rank": 1},
+    ]
+    real = eng.list_devices
+    eng.list_devices = lambda kind: fake
+    try:
+        gone = eng.resolve_device("AudioBox ASIO Driver", "ASIO", "input",
+                                  index_hint=3, default=0)
+        present = eng.resolve_device("Microphone (Realtek)", "Windows WASAPI",
+                                     "input", index_hint=7, default=3)
+        legacy = eng.resolve_device("", "", "input", index_hint=3, default=0)
+        stale = eng.resolve_device("", "", "input", index_hint=9, default=0)
+    finally:
+        eng.list_devices = real
+    check("unplugged saved device falls back to the default",
+          gone == 0 and present == 0 and legacy == 3 and stale == 0,
+          f"unplugged->{gone}, present->{present}, old-style->{legacy}, "
+          f"bad index->{stale}")
+
+    # 14. One definition per helper.
+    import inspect
+    src_eng = inspect.getsource(eng)
+    check("engine helpers are defined once",
+          src_eng.count("def _sink_score(") == 1,
+          f"_sink_score defined {src_eng.count('def _sink_score(')}x")
+
+
 def main():
     print("=" * 68)
     print("Tanin offline harness")
@@ -571,9 +954,13 @@ def main():
     test_midstream_events()
     test_looper()
     test_tuner()
-    test_aliasing()
     test_cpu_budget()
     test_broadcast_drift()
+    test_meters_and_mute()
+    test_presets_and_ir()
+    test_looper_safety()
+    from dsp_tests import run_all as run_dsp_audit  # noqa: E402
+    run_dsp_audit(check)
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)

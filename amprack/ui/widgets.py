@@ -182,13 +182,15 @@ class Knob(QWidget):
         arc_rect = QRectF(cx - track_r, cy - track_r, track_r * 2, track_r * 2)
 
         # Track
-        pen = QPen(_c(theme.STROKE), 3.0, Qt.SolidLine, Qt.RoundCap)
+        stroke = max(3.0, s / 16.0)
+        pen = QPen(_c(theme.STROKE_HI if self._active else theme.STROKE), stroke,
+                   Qt.SolidLine, Qt.RoundCap)
         p.setPen(pen)
         p.drawArc(arc_rect, int(START_ANGLE * 16), int(SWEEP * 16))
 
         # Value arc -- from centre outwards when the control is bipolar
         if self._active:
-            pen = QPen(acc, 3.0, Qt.SolidLine, Qt.RoundCap)
+            pen = QPen(acc, stroke, Qt.SolidLine, Qt.RoundCap)
             p.setPen(pen)
             if self.bipolar:
                 mid = START_ANGLE + SWEEP * 0.5
@@ -196,54 +198,34 @@ class Knob(QWidget):
             else:
                 p.drawArc(arc_rect, int(START_ANGLE * 16), int(SWEEP * t * 16))
 
-        # Body
-        body = QRectF(cx - r, cy - r, r * 2, r * 2)
-        g = QRadialGradient(QPointF(cx - r * 0.35, cy - r * 0.45), r * 1.7)
-        g.setColorAt(0.0, _c("#3b4250"))
-        g.setColorAt(0.55, _c("#262b35"))
-        g.setColorAt(1.0, _c("#171a20"))
-        p.setBrush(QBrush(g))
-        p.setPen(QPen(_c("#0d0f13"), 1.2))
+        # Body: one flat disc
+        body = QRectF(cx - r + 2, cy - r + 2, r * 2 - 4, r * 2 - 4)
+        touching = self._hover or self._drag_y is not None
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(_c(theme.HOVER if touching and self._active
+                             else theme.PANEL_HI)))
         p.drawEllipse(body)
-
-        inner = body.adjusted(r * 0.24, r * 0.24, -r * 0.24, -r * 0.24)
-        g2 = QLinearGradient(inner.topLeft(), inner.bottomRight())
-        g2.setColorAt(0.0, _c("#2e3440"))
-        g2.setColorAt(1.0, _c("#1d2129"))
-        p.setBrush(QBrush(g2))
-        p.setPen(QPen(_c("#12151a"), 1.0))
-        p.drawEllipse(inner)
 
         # Pointer
         ang = math.radians(START_ANGLE + SWEEP * t)
-        x0 = cx + math.cos(ang) * (r * 0.30)
-        y0 = cy - math.sin(ang) * (r * 0.30)
-        x1 = cx + math.cos(ang) * (r * 0.80)
-        y1 = cy - math.sin(ang) * (r * 0.80)
-        p.setPen(QPen(acc if self._active else _c(theme.TEXT_FAINT), 2.6,
-                      Qt.SolidLine, Qt.RoundCap))
+        x0 = cx + math.cos(ang) * (r * 0.38)
+        y0 = cy - math.sin(ang) * (r * 0.38)
+        x1 = cx + math.cos(ang) * (r * 0.78)
+        y1 = cy - math.sin(ang) * (r * 0.78)
+        p.setPen(QPen(_c(theme.TEXT) if self._active else _c(theme.TEXT_FAINT),
+                      max(2.0, s / 26.0), Qt.SolidLine, Qt.RoundCap))
         p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
-
-        if self._active and (self._hover or self._drag_y is not None):
-            glow = QRadialGradient(QPointF(cx, cy), track_r * 1.5)
-            glow.setColorAt(0.0, _c(self.accent, 0))
-            glow.setColorAt(0.75, _c(self.accent, 26))
-            glow.setColorAt(1.0, _c(self.accent, 0))
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(glow))
-            p.drawEllipse(QRectF(cx - track_r * 1.5, cy - track_r * 1.5,
-                                 track_r * 3, track_r * 3))
 
         # Caption: the value while you are touching it, the name otherwise.
         showing_value = self._hover or self._drag_y is not None
         f = QFont(self.font())
-        f.setPointSizeF(7.6)
-        f.setBold(showing_value)
-        f.setLetterSpacing(QFont.PercentageSpacing, 104 if showing_value else 112)
+        f.setPixelSize(12 if s >= 50 else 11)
+        f.setWeight(QFont.DemiBold if showing_value else QFont.Normal)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)
         p.setFont(f)
         p.setPen(QPen(acc if showing_value and self._active
                       else _c(theme.TEXT_DIM if self._active else theme.TEXT_FAINT)))
-        label = self.text() if showing_value else self.label.upper()
+        label = self.text() if showing_value else self.label.capitalize()
         p.drawText(QRectF(0, s + 8, w, 16), Qt.AlignHCenter | Qt.AlignTop, label)
         p.end()
 
@@ -290,24 +272,19 @@ class PowerLED(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        r = QRectF(1.5, 1.5, self.width() - 3, self.height() - 3)
+        r = QRectF(2, 2, self.width() - 4, self.height() - 4)
         if self._on:
-            g = QRadialGradient(r.center(), r.width())
-            g.setColorAt(0.0, _c(self.accent))
-            g.setColorAt(0.6, _c(self.accent, 210))
-            g.setColorAt(1.0, _c(self.accent, 70))
-            p.setBrush(QBrush(g))
-            p.setPen(QPen(_c(self.accent), 1.4))
-        else:
-            p.setBrush(QBrush(_c("#20242c")))
-            p.setPen(QPen(_c(theme.STROKE_HI if self._hover else theme.STROKE), 1.4))
-        p.drawEllipse(r)
-        if self._on:
-            p.setBrush(QBrush(_c("#ffffff", 150)))
+            p.setBrush(QBrush(_c(self.accent, 50)))
             p.setPen(Qt.NoPen)
-            hl = QRectF(r.left() + r.width() * 0.26, r.top() + r.height() * 0.20,
-                        r.width() * 0.26, r.height() * 0.22)
-            p.drawEllipse(hl)
+            p.drawEllipse(r)
+            inner = r.adjusted(r.width() * 0.22, r.height() * 0.22,
+                               -r.width() * 0.22, -r.height() * 0.22)
+            p.setBrush(QBrush(_c(self.accent)))
+            p.drawEllipse(inner)
+        else:
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(_c(theme.TEXT_DIM if self._hover else theme.TEXT_FAINT), 1.6))
+            p.drawEllipse(r.adjusted(1, 1, -1, -1))
         p.end()
 
 
@@ -322,13 +299,30 @@ class LevelMeter(QWidget):
     6 dB and tells you nothing about where you actually are.
     """
 
-    def __init__(self, channels: int = 2, horizontal: bool = True, parent=None):
+    CLIP_PAD = 11   # room for the clip light above (or right of) the bars
+
+    def __init__(self, channels: int = 2, horizontal: bool = True, parent=None,
+                 clip_light: bool = False):
         super().__init__(parent)
         self.horizontal = horizontal
         self.labels: list[str] = []
         self.highlight = -1     # index drawn in the accent colour
         self.channels = 0
+        self.clip_light = clip_light
+        self.clipped = False    # latched until clicked
         self.setChannelCount(channels)
+
+    def setClipped(self, on: bool) -> None:
+        if on != self.clipped:
+            self.clipped = on
+            self.update()
+
+    def mousePressEvent(self, e):
+        # Clip light latches so a split-second overload is never missed;
+        # clicking anywhere on the meter clears it.
+        if self.clip_light and self.clipped:
+            self.setClipped(False)
+        super().mousePressEvent(e)
 
     def setChannelCount(self, channels: int) -> None:
         channels = max(1, int(channels))
@@ -343,7 +337,7 @@ class LevelMeter(QWidget):
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self.setFixedHeight(8 * channels + 2)
         else:
-            self.setFixedWidth(10 * channels + 2)
+            self.setFixedWidth(max(12 * channels + 2, 22 if self.clip_light else 0))
             self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.updateGeometry()
 
@@ -377,12 +371,37 @@ class LevelMeter(QWidget):
         w, h = self.width(), self.height()
         n = self.channels
         pad = 14 if (self.labels and self.horizontal) else 0
+        vpad = 14 if (self.labels and not self.horizontal) else 0
+        cpad = self.CLIP_PAD if self.clip_light else 0
+        if cpad:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            if self.horizontal:
+                led = QRectF(w - cpad + 3, 1, cpad - 3, h - 2)
+            else:
+                led = QRectF(2, 0, max(8, n * 12 - 4), cpad - 4)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_c(theme.RED) if self.clipped else _c(theme.WELL))
+            p.drawRoundedRect(led, 2, 2)
         for i in range(n):
             if self.horizontal:
-                bar = QRectF(pad, i * 8 + 1, w - pad, 6)
+                bar = QRectF(pad, i * 8 + 1, w - pad - cpad, 6)
             else:
-                bar = QRectF(i * 10 + 1, 0, 8, h)
-            p.fillRect(bar, _c("#14171d"))
+                bar = QRectF(i * 12 + 2, cpad, 8, h - vpad - cpad)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            well = QPainterPath()
+            well.addRoundedRect(bar, 3, 3)
+            p.fillPath(well, _c(theme.WELL))
+            p.setClipPath(well)
+
+            if vpad and i < len(self.labels):
+                f = QFont(self.font())
+                f.setPointSizeF(7.0)
+                f.setBold(i == self.highlight)
+                p.setFont(f)
+                p.setPen(QPen(_c(theme.AMBER if i == self.highlight
+                                 else theme.TEXT_FAINT)))
+                p.drawText(QRectF(bar.left() - 3, h - vpad + 1, bar.width() + 6, 12),
+                           Qt.AlignHCenter | Qt.AlignVCenter, self.labels[i])
 
             if pad and i < len(self.labels):
                 f = QFont(self.font())
@@ -418,6 +437,7 @@ class LevelMeter(QWidget):
                 else:
                     y = bar.bottom() - bar.height() * pk
                     p.fillRect(QRectF(bar.left(), y - 1, bar.width(), 2), col)
+            p.setClipping(False)
         p.end()
 
 
@@ -444,7 +464,7 @@ class LoopProgress(QWidget):
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         path = QPainterPath()
         path.addRoundedRect(r, 6, 6)
-        p.fillPath(path, _c("#14171d"))
+        p.fillPath(path, _c(theme.WELL))
 
         col = {"recording": theme.RED, "overdubbing": theme.AMBER,
                "playing": theme.GREEN, "stopped": theme.TEXT_DIM}.get(
@@ -462,13 +482,10 @@ class LoopProgress(QWidget):
             p.fillRect(QRectF(x - 1, r.top(), 2, r.height()), _c(col))
             p.setClipping(False)
 
-        p.setPen(QPen(_c(theme.STROKE), 1))
-        p.drawPath(path)
-
         f = QFont(self.font())
-        f.setPointSizeF(8.0)
+        f.setPixelSize(11)
         f.setBold(True)
-        f.setLetterSpacing(QFont.PercentageSpacing, 108)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
         p.setFont(f)
         p.setPen(QPen(_c(col)))
         if self.state == "empty":
@@ -523,7 +540,8 @@ class TunerDisplay(QWidget):
 
         # Segment strip: 21 segments spanning +/-50 cents.
         segs = 21
-        strip_y = h - 22
+        strip_h = 8 if h < 140 else 14
+        strip_y = h - strip_h - 14
         seg_w = (w - 12) / segs
         centre = segs // 2
         lit = centre
@@ -532,28 +550,30 @@ class TunerDisplay(QWidget):
             lit = max(0, min(segs - 1, lit))
         for i in range(segs):
             x = 6 + i * seg_w
-            rect = QRectF(x + 1, strip_y, seg_w - 2, 8)
+            rect = QRectF(x + 1, strip_y, seg_w - 2, strip_h)
             is_centre = i == centre
             if self.active and i == lit:
                 c = col
             elif is_centre:
                 c = _c(theme.GREEN, 90)
             else:
-                c = _c("#20242c")
+                c = _c(theme.PANEL_HI)
             if self.active and ((centre < i <= lit) or (lit <= i < centre)):
                 c = _c(theme.AMBER, 110)
             p.fillRect(rect, c)
 
-        # Note name
+        # Note name -- grows with the widget so the big tuner page reads
+        # from across the room.
+        note_h = max(40.0, (h - 30) * 0.68)
         f = QFont(self.font())
-        f.setPointSizeF(24)
+        f.setPixelSize(int(max(30, note_h * 0.62)))
         f.setBold(True)
         p.setFont(f)
         p.setPen(QPen(col))
         name = self.note if self.active else "--"
-        p.drawText(QRectF(0, 2, w, 40), Qt.AlignCenter, name)
+        p.drawText(QRectF(0, 0, w, note_h), Qt.AlignCenter, name)
 
-        f.setPointSizeF(8.5)
+        f.setPixelSize(int(max(11, note_h * 0.12)))
         f.setBold(False)
         p.setFont(f)
         p.setPen(QPen(_c(theme.TEXT_DIM)))
@@ -561,7 +581,8 @@ class TunerDisplay(QWidget):
             sub = f"{self.octave}   {self.freq:6.1f} Hz   {self.cents:+.0f}¢"
         else:
             sub = "play a string"
-        p.drawText(QRectF(0, 40, w, 16), Qt.AlignCenter, sub)
+        p.drawText(QRectF(0, note_h, w, max(16, strip_y - note_h - 4)),
+                   Qt.AlignCenter, sub)
         p.end()
 
 
@@ -585,7 +606,7 @@ class LoadIndicator(QWidget):
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         path = QPainterPath()
         path.addRoundedRect(r, 4, 4)
-        p.fillPath(path, _c("#14171d"))
+        p.fillPath(path, _c(theme.WELL))
         frac = min(self.load, 1.0)
         col = theme.GREEN if frac < 0.5 else (theme.YELLOW if frac < 0.75 else theme.RED)
         p.setClipPath(path)
@@ -594,11 +615,127 @@ class LoadIndicator(QWidget):
         p.fillRect(QRectF(r.left() + r.width() * pk - 1, r.top(), 2, r.height()),
                    _c(col, 200))
         p.setClipping(False)
-        p.setPen(QPen(_c(theme.STROKE), 1))
-        p.drawPath(path)
         f = QFont(self.font())
         f.setPointSizeF(7.5)
         p.setFont(f)
         p.setPen(QPen(_c(theme.TEXT_DIM)))
         p.drawText(r, Qt.AlignCenter, f"DSP {self.load*100:.0f}%")
+        p.end()
+
+
+# ==========================================================================
+# Signal-chain tile
+# ==========================================================================
+
+class ChainTile(QWidget):
+    """One stop in the signal chain. Click the body to edit the module, click
+    the dot to switch it on or off. Off modules go grey so the path your
+    signal actually takes reads at a glance."""
+
+    selected = Signal(str)
+    powerToggled = Signal(str, bool)
+
+    def __init__(self, key: str, title: str, accent: str,
+                 always_on: bool = False, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.title = title
+        self.accent = accent
+        self.always_on = always_on
+        self.subtitle = ""
+        self._on = True
+        self._selected = False
+        self._hover = False
+        self.setFixedHeight(64)
+        self.setMinimumWidth(92)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+
+    def _led_rect(self) -> QRectF:
+        return QRectF(self.width() - 26, 12, 16, 16)
+
+    def set_state(self, on: bool, subtitle: str) -> None:
+        on = True if self.always_on else bool(on)
+        if on != self._on or subtitle != self.subtitle:
+            self._on, self.subtitle = on, subtitle
+            self.update()
+
+    def set_selected(self, sel: bool) -> None:
+        if sel != self._selected:
+            self._selected = sel
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        if not self.always_on and self._led_rect().adjusted(-6, -6, 6, 6).contains(
+                e.position()):
+            self._on = not self._on
+            self.update()
+            self.powerToggled.emit(self.key, self._on)
+        else:
+            self.selected.emit(self.key)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        path = QPainterPath()
+        path.addRoundedRect(r, 10, 10)
+        if self._selected:
+            bg = _c(theme.HOVER)
+        elif self._hover:
+            bg = _c(theme.PANEL_HI)
+        else:
+            bg = _c(theme.BG)
+        p.fillPath(path, bg)
+        acc = _c(self.accent) if self._on else _c(theme.TEXT_FAINT)
+        if self._selected:
+            p.setPen(QPen(_c(self.accent, 200), 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+        # small colour mark: lit when the module is on
+        mark = QRectF(11, 14, 4, 12)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(_c(self.accent, 255 if self._on else 55)))
+        p.drawRoundedRect(mark, 2, 2)
+
+        # power toggle
+        if not self.always_on:
+            lr = self._led_rect()
+            if self._on:
+                p.setBrush(QBrush(_c(self.accent, 50)))
+                p.drawEllipse(lr)
+                p.setBrush(QBrush(_c(self.accent)))
+                p.drawEllipse(lr.adjusted(3.5, 3.5, -3.5, -3.5))
+            else:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(_c(theme.TEXT_FAINT), 1.5))
+                p.drawEllipse(lr.adjusted(1, 1, -1, -1))
+
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(QPen(_c(theme.TEXT) if self._on else _c(theme.TEXT_DIM)))
+        p.drawText(QRectF(22, 11, r.width() - 50, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                   self.title if self.title == "IR" else self.title.capitalize())
+
+        f.setWeight(QFont.Normal)
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(QPen(acc if self._on else _c(theme.TEXT_FAINT)))
+        sub = self.subtitle if self._on else "Off"
+        p.drawText(QRectF(11, 36, r.width() - 18, 18), Qt.AlignLeft | Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(sub, Qt.ElideRight, int(r.width() - 18)))
         p.end()
