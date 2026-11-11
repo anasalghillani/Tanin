@@ -894,12 +894,10 @@ def test_looper_safety():
     import tempfile
     tmp = tempfile.mkdtemp(prefix="tanin-harness-")
     e = Engine(tmp)
-    e.chain.prepare(SR, block)
-    e.looper.prepare(SR, block)
-    e.recorder.prepare(SR)
-    e.metronome.prepare(SR)
+    # Same setup start() does, so the callback's work buffers exist.
+    e.samplerate = SR
     e.active_blocksize = block
-    e._deadline = block / SR
+    e._prepare_buffers(1)
     indata = np.zeros((block, 1), dtype=np.float32)
     outdata = np.zeros((block, 2), dtype=np.float32)
     class _LiveStream:        # stands in for an open stream
