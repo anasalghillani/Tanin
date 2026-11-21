@@ -3,3 +3,4 @@ scipy
 sounddevice
 soundfile
 PySide6
+numba
