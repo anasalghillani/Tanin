@@ -961,6 +961,8 @@ def main():
     test_looper_safety()
     from dsp_tests import run_all as run_dsp_audit  # noqa: E402
     run_dsp_audit(check)
+    from suite_tests import run_all as run_suite  # noqa: E402
+    run_suite(check)
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)
