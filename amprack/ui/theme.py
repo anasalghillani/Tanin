@@ -41,6 +41,9 @@ ACCENTS = {
     "looper": "#3ddc97",
     "rec":    "#ff5f6d",
     "master": "#ff8a3d",
+    "guitar": "#ff8a3d",
+    "piano":  "#56c8ff",
+    "vocals": "#ff5fd2",
 }
 
 
