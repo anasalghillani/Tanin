@@ -5,7 +5,7 @@ A real-time guitar amp and pedalboard for Windows, built in Python. It's a stand
 - **Location:** `%USERPROFILE%\Documents\AmpRack`
 - **Run:** `Tanin.cmd`, or `.venv\Scripts\python.exe run.py`
 - **List devices:** `.venv\Scripts\python.exe run.py --devices`
-- **Tests:** `.venv\Scripts\python.exe tools\harness.py`. This is **40/40 passing** and must stay green.
+- **Tests:** `.venv\Scripts\python.exe tools\harness.py`. This is **100/100 passing** and must stay green.
 - **GitHub:** https://github.com/anasalghillani/Tanin (public). Product name is **Tanin**;
   it was called AmpRack during development. The local folder is still `Documents\AmpRack`
   and the Python package is still `amprack` — renaming the folder breaks the venv's absolute
@@ -24,7 +24,7 @@ A real-time guitar amp and pedalboard for Windows, built in Python. It's a stand
 | Mic | AudioBox **Input 2** (`ch1`). Discord uses it for voice. |
 | Discord voice | Input **and** output both on the AudioBox |
 | Python | 3.12 at `...\Programs\Python\Python312`, run via `py -3.12`. Plain `python` is the Store stub. |
-| Venv deps | numpy, scipy, sounddevice, soundfile, PySide6 |
+| Venv deps | numpy, scipy, sounddevice, soundfile, PySide6, numba |
 | Driver panel | `C:\Program Files\PreSonus\Universal Control\Universal Control.exe` |
 
 ### User preferences
@@ -59,7 +59,19 @@ amprack/
                     LoopProgress, TunerDisplay, LoadIndicator
   ui/pedals.py      declarative KnobSpec/SelectSpec → PedalCard; IRCard subclass
   ui/main.py        MainWindow: header, Audio Setup panel, I/O strip, board, transport
-tools/harness.py    offline test suite
+  instrument.py     Instrument interface: prepare / process(mono, n) -> stereo /
+                    snapshot / apply, enabled, input_channel (per instrument)
+  instruments/      guitar.py (wraps dsp/chain.py), vocals.py (vocal chain +
+                    5 vocal presets, apply_vocal_preset keeps key and range)
+  mixer.py          Strip (volume, pan, mute, solo) + send matrix to 3 buses:
+                    phones, record, stream
+  dsp/autotune.py   McLeod detection every ~5 ms + real-time TD-PSOLA (numba),
+                    fixed 12.5 ms latency, block-size invariant
+  dsp/scales.py     keys, 12 scales (incl. Custom), C1..C6 range, snapping
+  dsp/vocal_blocks.py  DeEsser, VocalEQ, Saturation, Doubler
+  ui/vocals_panel.py   temporary Vocals tab in the dock (until phase 4)
+tools/harness.py    offline test suite (suite_tests.py = phases 1-2)
+tools/bench_instruments.py  callback load with 3 instruments at 128/256
 settings.json       saved devices (by NAME + API, not by index), channel, Stream Out
 ```
 
@@ -71,6 +83,26 @@ settings.json       saved devices (by NAME + API, not by index), channel, Stream
 - Every effect must be bit-exact when bypassed and block-size invariant. The harness checks both.
 
 ---
+
+## Instrument suite (phases 1-2, Nov 2026)
+
+Plan: "Tanin Suite Plan" doc (6 phases). Phases 1 (engine foundation) and 2
+(vocals + auto-tune) are in. Callback flow now: every enabled instrument reads
+its own input channel and runs its chain -> mixer strips and sends -> phones /
+record / stream buses -> looper (records phones, playback added to all three)
+-> click -> tuner mute -> recorder (record bus) / Stream Out (stream bus) ->
+output (phones bus). `engine.chain` and `engine.input_channel` still point at
+the guitar, so the guitar UI is unchanged. Vocals default **off**, on In 2.
+
+- numba compiles the PSOLA kernel in `AutoTune.prepare()` (control thread);
+  first run after install takes a few seconds, then it is cached.
+- CPU, measured on a Mac (callback with guitar fully loaded + vocals Hard Tune
+  + a second full guitar chain standing in for piano): 256 samples about 41%
+  mean / 52% p99; 128 samples about 63% mean / 80-100% p99. So three
+  instruments want a 256 buffer; two (guitar + vocals) are fine at 128 (37%).
+  Re-run `tools/bench_instruments.py` on the Windows PC for its own numbers.
+- Tried replacing scipy `lfilter` with a numba kernel: only 4% saved, not
+  bit-exact, reverted. The cost is spread over many small numpy calls.
 
 ## Hard-won facts. Don't re-learn these.
 

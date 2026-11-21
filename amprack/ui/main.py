@@ -48,6 +48,7 @@ from ..engine import (
 from ..tuner import detect_pitch, freq_to_note
 from . import theme
 from .pedals import ORDER, build_card, card_title
+from .vocals_panel import VocalsPanel
 from .widgets import (ChainTile, Knob, LevelMeter, LoadIndicator, LoopProgress,
                       PowerLED, TunerDisplay)
 
@@ -415,7 +416,21 @@ class MainWindow(QMainWindow):
         self.dock.addTab(self._build_looper(), "Looper")
         self.dock.addTab(self._build_recorder(), "Recorder")
         self.dock.addTab(self._build_click(), "Click")
+        # Temporary home for the vocal chain until the suite's own Vocals
+        # page (phase 4). It needs a little more height than the others.
+        self.vocals_panel = VocalsPanel(self.engine)
+        self.vocals_panel.restore(self._settings.get("vocals", {}))
+        self._vocals_tab = self.dock.addTab(self.vocals_panel, "Vocals")
+        self.vocals_panel.on_resize = self._fit_dock
+        self.dock.currentChanged.connect(lambda _i: self._fit_dock())
         return self.dock
+
+    def _fit_dock(self) -> None:
+        if self.dock.currentIndex() == self._vocals_tab:
+            self.dock.setFixedHeight(self.vocals_panel.preferred_height()
+                                     + self.dock.tabBar().sizeHint().height())
+        else:
+            self.dock.setFixedHeight(164)
 
     def _build_looper(self) -> QWidget:
         lp = self.engine.looper
@@ -1147,6 +1162,7 @@ class MainWindow(QMainWindow):
             "broadcast": self.engine.broadcast.enabled,
             "broadcast_name": dev_name(self.engine.broadcast_device),
             "broadcast_api": hostapi_name(self.engine.broadcast_device),
+            "vocals": self.vocals_panel.state(),
         }
         try:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
@@ -1167,6 +1183,7 @@ class MainWindow(QMainWindow):
             self.in_meter.setChannelCount(nch)
             self.in_meter.labels = [str(i + 1) for i in range(nch)]
             self.in_meter.highlight = e.input_channel
+            self.vocals_panel.set_input_channels(nch)
         if e.running:
             # Highest peak since the last tick, so short picks are not missed.
             pin, pout = e.read_meters()
@@ -1212,6 +1229,8 @@ class MainWindow(QMainWindow):
 
         if self._tick % 6 == 0:
             self._refresh_tiles()
+        if self._tick % 3 == 0 and self.dock.currentIndex() == self._vocals_tab:
+            self.vocals_panel.tick()
 
     def _update_status(self) -> None:
         e = self.engine

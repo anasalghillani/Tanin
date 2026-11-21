@@ -30,7 +30,9 @@ os.environ.setdefault("SD_ENABLE_ASIO", "1")
 import sounddevice as sd  # noqa: E402
 
 from .dsp.chain import Chain
+from .instruments import GuitarInstrument, VocalsInstrument
 from .looper import Looper
+from .mixer import BUSES, Mixer
 from .recorder import Recorder
 from .tuner import InputRing
 
@@ -266,7 +268,12 @@ class BroadcastOut:
 
 class Engine:
     def __init__(self, recordings_dir: str):
-        self.chain = Chain()
+        # Instruments, in mixer order. Each reads its own hardware input and
+        # runs its own chain; all of them play at once.
+        self.guitar = GuitarInstrument(input_channel=0)
+        self.vocals = VocalsInstrument(input_channel=1)
+        self.instruments = [self.guitar, self.vocals]
+        self.mixer = Mixer([i.key for i in self.instruments])
         self.looper = Looper()
         self.looper.post = self.post   # loop buttons land between blocks
         self.recorder = Recorder(recordings_dir)
@@ -280,7 +287,6 @@ class Engine:
         self.active_blocksize = 256   # what the driver actually gave us
         self.input_device = None
         self.output_device = None
-        self.input_channel = 0        # which hardware input the guitar is in
         self.exclusive = True         # WASAPI exclusive mode -> real latency
         self.using_asio = False
         self.monitor_dry = False
@@ -318,7 +324,32 @@ class Engine:
 
         self._commands: deque = deque()
         self._mono_in = np.zeros(0, dtype=np.float64)
+        self._outs: list = [None] * len(self.instruments)
+        self._click = np.zeros((2, 0), dtype=np.float64)
+        self._loop_part = np.zeros((2, 0), dtype=np.float64)
         self._deadline = 1.0
+
+    # -- instruments -------------------------------------------------------
+
+    @property
+    def chain(self) -> Chain:
+        """The guitar chain. Kept so today's guitar UI works unchanged."""
+        return self.guitar.chain
+
+    @property
+    def input_channel(self) -> int:
+        """Which hardware input the guitar is in."""
+        return self.guitar.input_channel
+
+    @input_channel.setter
+    def input_channel(self, ch: int) -> None:
+        self.guitar.input_channel = int(ch)
+
+    def instrument(self, key: str):
+        for inst in self.instruments:
+            if inst.key == key:
+                return inst
+        raise KeyError(key)
 
     # -- control-thread API ------------------------------------------------
 
@@ -583,19 +614,28 @@ class Engine:
 
     def _prepare_buffers(self, max_in_channels: int) -> None:
         self._in_channels = max(1, min(int(max_in_channels), 8))
-        if self.input_channel >= self._in_channels:
-            self.input_channel = 0
+        for inst in self.instruments:
+            ch = inst.input_channel
+            if ch is not None and ch >= self._in_channels:
+                # A mono interface: everything shares input 1 rather than
+                # reading a jack that is not there.
+                inst.input_channel = 0
         sr = float(self.samplerate)
         n = int(self.active_blocksize)
         # Was a clear() further down, which silently dropped preset and IR
         # changes made while stopped. Run them instead (no stream yet, so no
         # race), and before prepare() so it sizes whatever they swapped in.
         self._drain_commands()
-        self.chain.prepare(sr, n)
+        for inst in self.instruments:
+            inst.prepare(sr, n)
+        self.mixer.prepare(n)
         self.looper.prepare(sr, n)
         self.recorder.prepare(sr)
         self.metronome.prepare(sr)
         self._mono_in = np.zeros(n, dtype=np.float64)
+        self._click = np.zeros((2, n), dtype=np.float64)
+        self._loop_part = np.zeros((2, n), dtype=np.float64)
+        self._outs = [None] * len(self.instruments)
         self._deadline = n / sr
         self.xruns = 0
         self.callback_errors = 0
@@ -651,29 +691,75 @@ class Engine:
             np.maximum(self._in_acc[:nch], blk, out=self._in_acc[:nch])
             self.n_input_channels = nch
 
-            ch = self.input_channel
-            if ch >= nch:
-                ch = 0
-            if blk[ch] >= 0.999:
+            # The guitar's channel keeps feeding the tuner, the DI file and
+            # the clip light, exactly as before.
+            gch = self.guitar.input_channel
+            if gch is None or gch >= nch:
+                gch = 0
+            if blk[gch] >= 0.999:
                 self.in_clips += 1
-            mono = indata[:, ch].astype(np.float64)
-            self.input_ring.push(indata[:, ch], n)
+            mono = indata[:, gch].astype(np.float64)
+            self.input_ring.push(indata[:, gch], n)
 
-            wet = self.chain.process(mono)
+            # Every enabled instrument reads its own input and runs its
+            # own chain. Off means skipped: no CPU.
+            outs = self._outs
+            for i, inst in enumerate(self.instruments):
+                if not inst.enabled:
+                    outs[i] = None
+                    continue
+                if inst is self.guitar:
+                    src = mono
+                elif inst.uses_audio_input:
+                    c = inst.input_channel
+                    if c is None or c >= nch:
+                        c = 0
+                    if blk[c] >= 0.999:
+                        inst.in_clips += 1
+                    src = indata[:, c].astype(np.float64)
+                else:
+                    src = None
+                outs[i] = inst.process(src, n)
+
+            # Strips and sends -> phones / record / stream buses.
+            self.mixer.process(outs, n)
+            phones = self.mixer.bus_view("phones", n)
+            record = self.mixer.bus_view("record", n)
+            stream = self.mixer.bus_view("stream", n)
 
             if self.monitor_dry:
-                wet[0] += mono * 0.5
-                wet[1] += mono * 0.5
+                for bus in (phones, record, stream):
+                    bus[0] += mono * 0.5
+                    bus[1] += mono * 0.5
 
-            wet = self.looper.process(wet, n)
-            self.metronome.render(wet, n)
+            # The looper records what you hear; its playback then goes to
+            # every bus.
+            looped = self.looper.process(phones, n)
+            if looped is not phones:
+                lp = self._loop_part[:, :n]
+                np.subtract(looped, phones, out=lp)
+                phones[...] = looped
+                record += lp
+                stream += lp
+
+            if self.metronome.enabled:
+                click = self._click[:, :n]
+                click[...] = 0.0
+                self.metronome.render(click, n)
+                phones += click
+                record += click
+                stream += click
+            else:
+                self.metronome.render(self._click, 0)
+
             # Tuner mute goes before the recorder and Stream Out, so nobody
             # (you, the take, or Discord) hears the tuning.
             if self.output_muted or self._mute_gain < 1.0:
-                self._apply_mute(wet, n)
-            self.recorder.push(wet, mono, n)
-            self.broadcast.push(wet, n)
+                self._apply_mute((phones, record, stream), n)
+            self.recorder.push(record, mono, n)
+            self.broadcast.push(stream, n)
 
+            wet = phones
             np.nan_to_num(wet, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             # Measure before the hard clip, or clipping could never show.
             ao = self._abs_out[:, :n]
@@ -702,18 +788,20 @@ class Engine:
 
     # -- helpers for the UI ------------------------------------------------
 
-    def _apply_mute(self, wet: np.ndarray, n: int) -> None:
+    def _apply_mute(self, buses, n: int) -> None:
         """Tuner mute with a one-block ramp so it never clicks."""
         target = 0.0 if self.output_muted else 1.0
         g0 = self._mute_gain
         if g0 == target:
             if target == 0.0:
-                wet[...] = 0.0
+                for wet in buses:
+                    wet[...] = 0.0
             return
         g = self._gain_buf[:n]
         np.multiply(self._ramp[:n], target - g0, out=g)
         g += g0
-        wet *= g
+        for wet in buses:
+            wet *= g
         self._mute_gain = target
 
     def _publish_meters(self) -> None:
@@ -742,7 +830,8 @@ class Engine:
 
     def panic(self) -> None:
         """Kill anything ringing: delay tails, reverb, looper playback."""
-        self.post(self.chain.reset)
+        for inst in self.instruments:
+            self.post(inst.reset)
 
 
 # --------------------------------------------------------------------------
