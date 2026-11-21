@@ -575,10 +575,74 @@ def test_new_voicings(check):
     check("every cabinet (incl. new ones) with every mic is finite", not bad, ", ".join(bad))
 
 
+def test_gearmap(check):
+    print("\n[FX10] song-tone gear mapping")
+    from amprack import gearmap
+    bad = gearmap.known_targets_ok()
+    check("every amp, cab, mic and effect the mapping table names exists in Tanin",
+          not bad, "; ".join(bad[:4]))
+    missing = [k for k in gearmap.FX_MAP if gearmap.lookup_fx(k) is None]
+    check("every known pedal and rack key maps to an effect", not missing,
+          ", ".join(missing[:5]))
+
+    tone = {"GearList": {
+        "Amp": {"Key": "Amp_MarshallJCM800",
+                "Knobs": {"Amp_Gain": 72, "Amp_Bass": 40, "Amp_Mid": 65,
+                          "Amp_Treble": 55, "Amp_Presence": 50, "Amp_Volume": 60}},
+        "Cabinet": {"Key": "Cab_BT412C_Ribbon_Edge"},
+        "PrePedal1": {"Key": "Pedal_UKWah", "Knobs": {"Pedal_UKWah_Sensitivity": 70}},
+        "PrePedal2": {"Key": "Pedal_FuzzWasHe", "Knobs": {"Pedal_FuzzWasHe_Fuzz": 80,
+                                                          "Pedal_FuzzWasHe_Volume": 50}},
+        "PostPedal1": {"Key": "Pedal_ShaverPhaser", "Knobs": {"Pedal_ShaverPhaser_Rate": 30}},
+        "Rack1": {"Key": "Rack_StudioTapeDelay", "Knobs": {"Rack_StudioTapeDelay_Time": 380,
+                                                           "Rack_StudioTapeDelay_Mix": 25}},
+        "Rack2": {"Key": "Pedal_TubeSpring", "Knobs": {"Pedal_TubeSpring_Mix": 30}},
+        "Rack3": {"Key": "Pedal_EQ5", "Knobs": {"Pedal_EQ5_800": 4}},
+        "Rack4": {"Key": "Pedal_NotAThing"},
+    }}
+    pre, notes = gearmap.tone_to_preset(tone)
+    amp = pre["amp"]
+    r = pre["rack"]["slots"]
+    ok = (amp["model"] == "Brit 800" and abs(amp["gain"] - 0.72) < 1e-9
+          and pre["cab"]["mic"] == "Ribbon" and pre["gate"]["enabled"]
+          and pre["pre"]["slots"][0]["type"] == "wah"
+          and pre["pre"]["slots"][0]["params"]["source"] == "Envelope"
+          and pre["pre"]["slots"][1]["params"]["model"] == "Si Fuzz"
+          and abs(pre["pre"]["slots"][1]["params"]["gain"] - 0.8) < 1e-9
+          and r[0]["params"]["time_ms"] == 380.0
+          and abs(r[0]["params"]["mix"] - 0.25) < 1e-9
+          and r[1]["params"]["model"] == "Tank"
+          and r[2]["params"]["b3"] == 4.0
+          and any("Pedal_NotAThing" in n for n in notes))
+    check("a full song tone translates: amp knobs, cab mic, pedals, rack, EQ band",
+          ok, "" if ok else str(pre)[:300])
+
+    c = Chain()
+    c.prepare(SR, 256)
+    c.preload(pre)
+    c.apply(pre)
+    y = _run(c, _pluck(110.0, 1.5), 256)
+    snap = c.snapshot()
+    ok = (np.all(np.isfinite(y)) and float(np.max(np.abs(y))) <= 1.001
+          and snap["amp"]["model"] == "Brit 800"
+          and snap["rack"]["slots"][1]["type"] == "verb")
+    check("the mapped preset loads into a chain and plays, finite and limited", ok)
+
+    junk, _ = gearmap.tone_to_preset({"GearList": {"Amp": {"Key": 5, "Knobs": "x"},
+                                                   "PrePedal1": {"Key": "Pedal_Chorus",
+                                                                 "Knobs": {"a_Rate": "fast"}},
+                                                   "Rack1": [1, 2]}})
+    c.preload(junk)
+    c.apply(junk)
+    y = _run(c, _pluck(110.0, 0.3), 256)
+    check("malformed tone data maps without raising and plays",
+          bool(np.all(np.isfinite(y))))
+
+
 def run_all(check):
     for t in (test_fx_bypass, test_fx_sanity, test_fx_block_invariance, test_fx_aliasing,
               test_tonestack, test_fx_behaviour, test_fx_presets, test_fx_cpu,
-              test_new_voicings):
+              test_new_voicings, test_gearmap):
         try:
             t(check)
         except Exception as e:  # noqa: BLE001
