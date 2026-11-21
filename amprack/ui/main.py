@@ -313,12 +313,18 @@ class MainWindow(QMainWindow):
             return t if t and not t.startswith("no ") else "no file"
         if key in ("gate", "comp"):
             return "On"
+        card = self.cards.get(key)
+        if hasattr(card, "summary"):
+            return card.summary()
         return str(getattr(b, "model", None) or getattr(b, "mode", "") or "On")
 
     def _refresh_tiles(self) -> None:
         for key, tile in self.tiles.items():
-            tile.set_state(bool(getattr(self.engine.chain[key], "enabled", True)),
-                           self._tile_subtitle(key))
+            b = self.engine.chain[key]
+            on = bool(getattr(b, "enabled", True))
+            if hasattr(b, "slots"):     # a slot rack with nothing in it is off
+                on = on and b.active
+            tile.set_state(on, self._tile_subtitle(key))
 
     # ==================================================================
     # Focus panel: one module, big

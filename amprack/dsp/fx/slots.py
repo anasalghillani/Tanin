@@ -47,16 +47,17 @@ class FxSlots(Block):
         self.stereo = channels == 2
         self.enabled = True
         self.slots = [Slot() for _ in range(n_slots)]
-        self._prepared = False
 
     # -- lifecycle ----------------------------------------------------------
 
     def _build(self, fx_type: str):
         fx = FX_TYPES[fx_type]()
         fx.channels = 2 if fx.STEREO else self.channels
-        if self._prepared:
-            fx.prepare(self.sr, self.max_block)
-            fx.reset()
+        # Always prepared, at the rack's current rate (its defaults before the
+        # first prepare): a slot can be filled from the UI before audio starts,
+        # and prepare() re-prepares the whole pool when the stream opens.
+        fx.prepare(self.sr, self.max_block)
+        fx.reset()
         return fx
 
     def preload(self, i: int, fx_type: str) -> None:
@@ -69,7 +70,6 @@ class FxSlots(Block):
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._prepared = True
         for s in self.slots:
             for fx in s.pool.values():
                 fx.channels = 2 if fx.STEREO else self.channels

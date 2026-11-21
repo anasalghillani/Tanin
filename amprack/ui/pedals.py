@@ -350,17 +350,26 @@ CARDS = {
 IR_DESC = ("Loads a real cabinet recording (an impulse response .wav) in "
            "place of, or blended with, the built-in cabinet.")
 
-ORDER = ("gate", "comp", "drive", "amp", "cab", "ir", "mod", "delay", "reverb")
+ORDER = ("gate", "comp", "pre", "drive", "amp", "cab", "ir", "loop", "mod",
+         "delay", "reverb", "rack")
+
+SLOT_KEYS = ("pre", "loop", "rack")
 
 
 def card_title(key: str) -> tuple[str, str]:
     """(short tile name, full title)"""
     if key == "ir":
         return "IR", "IR LOADER"
+    if key in SLOT_KEYS:
+        from .slots_card import RACK_INFO
+        return RACK_INFO[key][1], RACK_INFO[key][0]
     return CARDS[key]["short"], CARDS[key]["title"]
 
 
 def build_card(engine, key: str, parent=None, **kw) -> PedalCard:
+    if key in SLOT_KEYS:
+        from .slots_card import SlotRackCard
+        return SlotRackCard(engine, key, parent, **kw)
     if key == "ir":
         card = IRCard(engine, parent, description=IR_DESC, **kw)
         card._mul = {"mix": PCT, "gain_db": 1.0}
