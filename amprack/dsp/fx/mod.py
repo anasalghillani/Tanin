@@ -5,10 +5,11 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy.signal import sosfilt
+from scipy.signal import lfilter, sosfilt
 
 from ..core import Biquad, DelayLine, LFO, OnePole, SmoothedParam, TWO_PI, clampf
 from .base import (
+    cell_start,
     LEVEL,
     MIX,
     SHAPES,
@@ -229,13 +230,17 @@ PHASER_VOICES = {
 class Phaser(Effect):
     """All-pass phaser with feedback.
 
-    The all-pass chain and the feedback around it are folded into one IIR
-    filter per 32-sample chunk, H = P / (Q - g P) with P and Q the all-pass
-    numerator and denominator, so the feedback is sample-exact rather than a
-    chunk late (a chunk of delay in the loop would be a comb filter, not a
-    phaser). Stages are spread slightly in frequency, as mismatched parts are
-    in the hardware; it also keeps the polynomial well conditioned. Above
-    four stages the extra ones run as a separate cascade outside the loop.
+    The four all-pass stages keep their own state (each stage's one state
+    variable, which, like a capacitor voltage, stays meaningful when the
+    stage's frequency moves), so a fast deep sweep glides instead of
+    bursting. Within each 64-sample chunk the stages and the feedback around
+    them are solved exactly as one filter, H = P / (Q - g P), so the feedback
+    is sample-accurate rather than a chunk late (a chunk of delay in the loop
+    would be a comb filter, not a phaser): the combined filter's starting
+    state comes from the stage states, and the stages are then run over the
+    chunk to carry their states forward. Stages are spread slightly in
+    frequency, as mismatched parts are in the hardware. Above four stages the
+    extra ones run as a separate cascade outside the loop.
     """
 
     TYPE = "phaser"
@@ -256,7 +261,7 @@ class Phaser(Effect):
         MIX,
     )
 
-    CHUNK = 32
+    CHUNK = 64   # 1.3 ms: far finer than any sweep a phaser makes
 
     def __init__(self):
         super().__init__()
@@ -264,15 +269,41 @@ class Phaser(Effect):
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._loop = TVFilter(4, 2)
+        self._st = np.zeros((2, 4))           # per-stage TDF-II state
         self._tail_zi = np.zeros((2, 4, 2))   # (channel, section, state)
         self._lfo = ShapeLFO()
         self._lfo.prepare(sr, max_block)
 
     def reset(self):
-        self._loop.reset()
+        self._st[...] = 0.0
         self._tail_zi[...] = 0.0
         self._lfo.reset()
+
+    @staticmethod
+    def _free_response(al, st, g, k):
+        """First k output samples of the loop with zero input, from the
+        stage states. Each stage: y = a u + s, s' = u - a y. The loop input
+        is g * wet, and wet depends on it instantly (gain prod(a)), so each
+        sample solves that one-unknown equation."""
+        s = list(st)
+        d = 1.0
+        for a in al:
+            d *= a
+        out = np.zeros(k)
+        for n in range(k):
+            # wet = c + d*u with u = g*wet  ->  wet = c / (1 - g d)
+            c = 0.0
+            for i, a in enumerate(al):
+                c = a * c + s[i]
+            wet = c / (1.0 - g * d)
+            u = g * wet
+            v = u
+            for i, a in enumerate(al):
+                y = a * v + s[i]
+                s[i] = v - a * y
+                v = y
+            out[n] = wet
+        return out
 
     def _process(self, x, n):
         stages, lo, hi, fbs, sp = PHASER_VOICES.get(self.model, PHASER_VOICES["Four-Stage"])
@@ -280,7 +311,7 @@ class Phaser(Effect):
         spread = 0.5 * clampf(self.spread, 0.0, 1.0)
         depth = clampf(self.depth, 0.0, 1.0)
         manual = clampf(self.manual, 0.0, 1.0)
-        g = clampf(self.feedback, 0.0, 1.0) * fbs * 0.92
+        g = clampf(self.feedback, 0.0, 1.0) * fbs * 0.7
         m = clampf(self.mix, 0.0, 1.0)
         span = math.log(hi / lo)
         mult = [math.exp(sp * (i - 1.5) * 0.5) for i in range(4)]
@@ -289,22 +320,36 @@ class Phaser(Effect):
         # they update on a coarser grid.
         chunk = self.CHUNK if stages <= 4 else self.CHUNK * 2
         for a, b in grid(self._t, n, chunk):
-            mid = (a + b) // 2
+            if self._cell is None or cell_start(self._t, a, chunk):
+                cell = []
+                for ch in range(2):
+                    w = 0.5 + 0.5 * ShapeLFO.shape(ph[a:a + 1] + (spread if ch else 0.0),
+                                                   self.shape)[0]
+                    pos = manual * (1.0 - depth) + w * depth
+                    fc = lo * math.exp(span * clampf(pos, 0.0, 1.0))
+                    al = [allpass1(fc * mult[i], self.sr) for i in range(4)]
+                    num = np.array([1.0])
+                    den = np.array([1.0])
+                    for c in al:
+                        num = np.convolve(num, [c, 1.0])
+                        den = np.convolve(den, [1.0, c])
+                    qd = den - g * num
+                    cell.append((fc, al, num / qd[0], qd / qd[0]))
+                self._cell = cell
             for ch in range(2):
-                w = 0.5 + 0.5 * ShapeLFO.shape(ph[mid:mid + 1] + (spread if ch else 0.0),
-                                               self.shape)[0]
-                pos = manual * (1.0 - depth) + w * depth
-                fc = lo * math.exp(span * clampf(pos, 0.0, 1.0))
-                num = np.array([1.0])
-                den = np.array([1.0])
-                for i in range(4):
-                    al = allpass1(fc * mult[i], self.sr)
-                    num = np.convolve(num, [al, 1.0])
-                    den = np.convolve(den, [1.0, al])
-                # Loop: wet = P / (Q - g P). Output (1-m) x + m wet folded in.
-                qd = den - g * num
-                bcoef = (1.0 - m) * qd + m * num
-                y = self._loop.run(bcoef / qd[0], qd / qd[0], x[ch, a:b], ch)
+                fc, al, bq, aq = self._cell[ch]
+                # Combined filter's DF2T state from the stages' states.
+                fr = self._free_response(al, self._st[ch], g, 4)
+                zi = np.array([fr[j] + sum(aq[i] * fr[j - i] for i in range(1, j + 1))
+                               for j in range(4)])
+                xs = x[ch, a:b]
+                wet, _ = lfilter(bq, aq, xs, zi=zi)
+                # Carry each stage's state across the chunk.
+                v = xs + g * wet
+                for i, c in enumerate(al):
+                    v, zf = lfilter([c, 1.0], [1.0, c], v, zi=self._st[ch, i:i + 1])
+                    self._st[ch, i] = zf[0]
+                y = x[ch, a:b] * (1.0 - m) + wet * m
                 if stages > 4:
                     # The remaining stages, outside the loop, on the wet part
                     # only. They move slowly within a chunk, so plain
@@ -355,7 +400,7 @@ class Vibe(Effect):
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._f = TVFilter(4, self.channels)
+        self._zi = np.zeros((4, self.channels, 1))   # per-stage TDF-II state
         self._lfo = LFO()
         self._lfo.prepare(sr, max_block)
         self._att = OnePole(4.0)
@@ -366,7 +411,7 @@ class Vibe(Effect):
         self._out.prepare(max_block)
 
     def reset(self):
-        self._f.reset()
+        self._zi[...] = 0.0
         self._att.reset()
         self._rel.reset()
         self._lfo.phase = 0.0
@@ -381,17 +426,18 @@ class Vibe(Effect):
         y = np.empty_like(x)
         chorus = self.model == "Chorus"
         for a, b in grid(self._t, n, self.CHUNK):
-            L = float(light[(a + b) // 2])
-            R = r_hi * (r_lo / r_hi) ** L
-            num = np.array([1.0])
-            den = np.array([1.0])
-            for c in self.CAPS:
-                fc = 1.0 / (TWO_PI * R * c * 1e-6)
-                al = allpass1(fc, self.sr)
-                num = np.convolve(num, [al, 1.0])
-                den = np.convolve(den, [1.0, al])
-            bcoef = (0.5 * den + 0.5 * num) if chorus else num
-            y[:, a:b] = self._f.run_all(bcoef, den, x[:, a:b])
+            if self._cell is None or cell_start(self._t, a, self.CHUNK):
+                L = float(light[a])
+                self._cell = r_hi * (r_lo / r_hi) ** L
+            R = self._cell
+            # Stage by stage, each keeping its own state: the 0.22 uF stage
+            # sits at a few Hz, where a combined high-order filter would be
+            # numerically fragile under modulation.
+            v = x[:, a:b]
+            for i, c in enumerate(self.CAPS):
+                al = allpass1(1.0 / (TWO_PI * R * c * 1e-6), self.sr)
+                v, self._zi[i] = lfilter([al, 1.0], [1.0, al], v, axis=-1, zi=self._zi[i])
+            y[:, a:b] = (x[:, a:b] + v) * 0.5 if chorus else v
         self._out.set(_level_gain(self.level) * (1.2 if chorus else 1.0))
         return y * self._out.ramp(n)
 

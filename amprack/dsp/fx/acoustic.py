@@ -15,6 +15,7 @@ Two parts, as in the pedals that do this:
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -33,6 +34,7 @@ BODIES = {
 IR_LEN = 2048   # 43 ms at 48 kHz: the body, not the room
 
 
+@lru_cache(maxsize=32)
 def body_ir(model: str, sr: float) -> np.ndarray:
     air, top1, top2, size, bright, seed = BODIES[model]
     rng = np.random.default_rng(seed)
@@ -52,6 +54,13 @@ def body_ir(model: str, sr: float) -> np.ndarray:
         ir += amp * np.exp(-t / tau) * np.sin(2 * math.pi * f * t + ph) * (2 * math.pi * f / sr)
     ir *= np.hanning(IR_LEN * 2)[IR_LEN:] ** 0.5
     return ir / np.sqrt(np.sum(ir * ir))
+
+
+@lru_cache(maxsize=32)
+def _kernel(model: str, sr: float, size: int) -> np.ndarray:
+    k = np.fft.rfft(body_ir(model, sr), size)
+    k.flags.writeable = False
+    return k
 
 
 class AcousticSim(Effect):
@@ -75,7 +84,7 @@ class AcousticSim(Effect):
         while size < max_block + IR_LEN:
             size <<= 1
         self._fft = size
-        self._kernels = {m: np.fft.rfft(body_ir(m, sr), size) for m in BODIES}
+        self._kernels = {m: _kernel(m, sr, size) for m in BODIES}
         self._hist = np.zeros((c, size))
         self._pk = Biquad("peak", 3200.0, 1.6, -7.0)      # pickup resonance out
         self._lm = Biquad("peak", 300.0, 0.8, -4.0)       # low-mid mud out

@@ -8,6 +8,7 @@ import numpy as np
 
 from ..core import Biquad, DelayLine, LFO, OnePole, SmoothedParam, clampf, db2lin
 from .base import (
+    cell_start,
     LEVEL,
     MIX,
     SHAPES,
@@ -125,14 +126,16 @@ class Wah(Effect):
         qscale = 0.55 + 0.9 * res
         y = np.empty_like(x)
         for a, b in grid(self._t, n, CHUNK):
-            c = float(ctrl[(a + b) // 2])
-            fc = lo * (hi / lo) ** c
-            q = (q_heel + (q_toe - q_heel) * c) * qscale
-            bb, aa = svf_coeffs("bp", fc, q, self.sr)
-            bl, _ = svf_coeffs("lp", fc, q, self.sr)
-            # Peak gain of the band-pass is 0 dB; a real wah's peak sits well
-            # above its pass band, which the weights restore.
-            coef_b = bb * kb * (0.8 + 0.25 * q) + bl * kl
+            if self._cell is None or cell_start(self._t, a, CHUNK):
+                c = float(ctrl[a])
+                fc = lo * (hi / lo) ** c
+                q = (q_heel + (q_toe - q_heel) * c) * qscale
+                bb, aa = svf_coeffs("bp", fc, q, self.sr)
+                bl, _ = svf_coeffs("lp", fc, q, self.sr)
+                # Peak gain of the band-pass is 0 dB; a real wah's peak sits
+                # well above its pass band, which the weights restore.
+                self._cell = (bb * kb * (0.8 + 0.25 * q) + bl * kl, aa)
+            coef_b, aa = self._cell
             y[:, a:b] = self._f.run_all(coef_b, aa, x[:, a:b])
         self._out.set(_level_gain(self.level))
         y *= self._out.ramp(n)
@@ -240,9 +243,11 @@ class AutoFilter(Effect):
         res = clampf(self.q, 0.0, 1.0)
         y = np.empty_like(x)
         for a, b in grid(self._t, n, CHUNK):
-            c = float(ctrl[(a + b) // 2])
-            fc = self.LO * (self.HI / self.LO) ** c
-            bb, aa = self._coeffs(fc, res)
+            if self._cell is None or cell_start(self._t, a, CHUNK):
+                c = float(ctrl[a])
+                fc = self.LO * (self.HI / self.LO) ** c
+                self._cell = self._coeffs(fc, res)
+            bb, aa = self._cell
             y[:, a:b] = self._f.run_all(bb, aa, x[:, a:b])
         np.tanh(y * 0.8, out=y)       # a resonant peak can jump 20 dB: tame it
         y *= 1.25
@@ -340,11 +345,11 @@ class LoFi(Effect):
         g = 1.0 + clampf(self.drive, 0.0, 1.0) * 14.0 * dsc
         sig = np.tanh(sig * g) / math.tanh(min(g, 3.0)) * 0.32
         nz = clampf(self.noise, 0.0, 1.0) * nsc
+        # Drawn sample-major, (n, channels), so the noise is the same stream
+        # whatever the buffer size; drawn even when silent to stay aligned.
+        hiss = self._rng.standard_normal((n, x.shape[0])).T
         if nz > 0.0:
-            hiss = self._rng.standard_normal((x.shape[0], n)) * (0.004 * nz)
-            sig = sig + hiss
-        else:
-            self._rng.standard_normal((x.shape[0], n))   # keep the stream aligned
+            sig = sig + hiss * (0.004 * nz)
         self._out.set(_level_gain(self.level))
         sig = sig * self._out.ramp(n)
         m = clampf(self.mix, 0.0, 1.0)

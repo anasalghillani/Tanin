@@ -158,7 +158,9 @@ class Echo(Effect):
                 fbsrc = wet
             fed = self._hp.process(self._lp.process(fbsrc))
             if sat > 0.0:
-                fed = np.tanh(fed * (1.0 + 0.6 * sat)) / (1.0 + 0.6 * sat) * 1.35
+                # Unity small-signal gain: only loud repeats are squashed, so
+                # Repeats past 1.0 self-oscillate and settle, below it they die.
+                fed = np.tanh(fed * (1.0 + 0.6 * sat)) / (1.0 + 0.6 * sat)
             if lofi:
                 fed = np.round(fed * 64.0) / 64.0
             if pingpong:
@@ -272,7 +274,10 @@ class Verb(Effect):
         self._damp = OnePole(1.0)
         self._damp.prepare(sr, 8)
         # Input diffusers (Schroeder all-pass), short and mutually prime.
-        self._diff_len = [int(t * sr / 48000.0) for t in (142, 107, 379, 277)]
+        # Each at least one chunk long: a feedback delay shorter than the
+        # chunk would have to change length at block edges.
+        self._diff_len = [max(int(t * sr / 48000.0), self.CHUNK + 1)
+                          for t in (142, 167, 379, 277)]
         self._diff = [DelayLine(l + mb + 16, 1) for l in self._diff_len]
         for d in self._diff:
             d.prepare(mb)
@@ -382,8 +387,7 @@ class Verb(Effect):
             seg = mono[a:b]
             # Input diffusion.
             for i, dl in enumerate(self._diff):
-                L = max(self._diff_len[i], k + 1)
-                buf = dl.read_fixed(L, k)[0]
+                buf = dl.read_fixed(self._diff_len[i], k)[0]
                 dl.write((seg + buf * diff)[None, :])
                 seg = buf - seg * diff
             taps = np.empty((8, k))

@@ -309,7 +309,9 @@ class AmpModel:
 
     def __init__(self, name, stages, stage_gain, bias, input_hp, coupling_lp,
                  tone_bass, tone_mid, tone_mid_q, tone_treble, out_lp, gain_range,
-                 shaper="tube", stage_hp=30.0, stage_lp_ratio=1.5):
+                 shaper="tube", stage_hp=30.0, stage_lp_ratio=1.5, stack=None,
+                 stack_pre=False, single_tone=False, geq=(), power=0.0,
+                 power_asym=0.0, bright_db=0.0, master=True, family=""):
         self.name = name
         self.stages = stages
         self.stage_gain = stage_gain
@@ -327,6 +329,18 @@ class AmpModel:
         # and Miller-capacitance lowpass between gain stages.
         self.stage_hp = stage_hp
         self.stage_lp = coupling_lp * stage_lp_ratio
+        # Circuit-modelled voicings (amprack/dsp/voicings.py). The four
+        # original models leave all of these at their defaults and take
+        # exactly the code path they always did.
+        self.stack = stack            # passive TMB stack type, or None: shelves
+        self.stack_pre = stack_pre    # stack before the gain stages (Cali Lead)
+        self.single_tone = single_tone  # one Tone knob (tweed): Treble sweeps it
+        self.geq = tuple(geq)         # fixed voicing EQ: ((hz, db), ...)
+        self.power = power            # power-amp drive; 0 = clean power amp
+        self.power_asym = power_asym  # single-ended / class A asymmetry
+        self.bright_db = bright_db    # bright cap: fades as Gain comes up
+        self.master = master          # False: no master volume on the real amp
+        self.family = family
 
 
 AMP_MODELS = {
@@ -380,8 +394,8 @@ class Amp(Block):
         self.sag = 0.3
 
         self._in_hp = Biquad("highpass", 70.0, 0.707)
-        self._couple = [Biquad("lowpass", 9000.0, 0.707) for _ in range(4)]
-        self._stage_hp = [Biquad("highpass", 30.0, 0.707) for _ in range(4)]
+        self._couple = [Biquad("lowpass", 9000.0, 0.707) for _ in range(6)]
+        self._stage_hp = [Biquad("highpass", 30.0, 0.707) for _ in range(6)]
         self._bass = Biquad("lowshelf", 110.0, 0.707)
         self._mid = Biquad("peak", 650.0, 0.7)
         self._treble = Biquad("highshelf", 2800.0, 0.707)
@@ -392,6 +406,13 @@ class Amp(Block):
         self._sag_env = OnePole(60.0)
         self._master = SmoothedParam(0.5)
         self.output_level = 0.0  # telemetry
+        # Circuit-modelled voicings only.
+        from .tonestack import ToneStack
+        self._stack = ToneStack()
+        self._bright = Biquad("highshelf", 2500.0, 0.707, 0.0)
+        self._single = Biquad("lowpass", 5000.0, 0.6)
+        self._geq = [Biquad("peak", 1000.0, 0.9, 0.0) for _ in range(5)]
+        self._os_pa = Oversampler()
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
@@ -409,6 +430,10 @@ class Amp(Block):
         self._sag_env.reset()
         self._master.prepare(max_block)
         self._master.snap(db2lin(-12.0))
+        self._stack.prepare(sr)
+        for f in [self._bright, self._single] + self._geq:
+            f.prepare(sr, 1)
+        self._os_pa.prepare(sr, max_block)
 
     def reset(self):
         for f in (self._in_hp, self._bass, self._mid, self._treble,
@@ -421,13 +446,41 @@ class Amp(Block):
         self._dc.reset()
         self._os.reset()
         self._sag_env.reset()
+        self._stack.reset()
+        for f in [self._bright, self._single] + self._geq:
+            f.reset()
+        self._os_pa.reset()
+
+    def _voicing_eq(self, sig, m, geq=True):
+        """Tone section of a circuit-modelled voicing."""
+        if m.single_tone:
+            # One tone knob: a treble bleed sweeping a gentle low-pass.
+            self._single.set(f0=1100.0 * (10.0 ** clampf(self.treble, 0.0, 1.0)))
+            sig = self._single.process(sig)
+        else:
+            self._stack.set(m.stack, self.treble, self.mid, self.bass)
+            sig = self._stack.process(sig)
+        if geq:
+            for i, (f0, db) in enumerate(m.geq[:5]):
+                self._geq[i].set(f0=f0, gain_db=db)
+                sig = self._geq[i].process(sig)
+        return sig
 
     def _process(self, x, n):
         m = AMP_MODELS.get(self.model, AMP_MODELS["Crunch"])
         shaper = SHAPERS[m.shaper]
+        modelled = m.stack is not None or m.single_tone
 
         self._in_hp.set(f0=m.input_hp)
         sig = self._in_hp.process(x)
+        if m.bright_db:
+            # Bright cap across the gain pot: loud at low gain, gone at full.
+            self._bright.set(gain_db=m.bright_db * (1.0 - clampf(self.gain, 0.0, 1.0)))
+            sig = self._bright.process(sig)
+        if modelled and m.stack_pre:
+            # Stack in front of the cascaded lead stages: the EQ shapes what
+            # gets distorted rather than the distortion.
+            sig = self._voicing_eq(sig, m, geq=False) * 2.0
 
         gmin, gmax = m.gain_range
         total = gmin * (gmax / gmin) ** clampf(self.gain, 0.0, 1.0)
@@ -444,7 +497,10 @@ class Amp(Block):
         up = self._os.up(sig)
         inter = self.interstage
         for i in range(m.stages):
-            up = shaper(up, per_stage, m.bias * (1.0 if i % 2 == 0 else -0.6))
+            if m.shaper == "tube":
+                up = shaper(up, per_stage, m.bias * (1.0 if i % 2 == 0 else -0.6))
+            else:
+                up = shaper(up, per_stage)
             up *= 0.85  # inter-stage attenuation, keeps later stages in range
             if inter and i < m.stages - 1:
                 # Between stages, at the oversampled rate so the lowpass acts
@@ -461,17 +517,38 @@ class Amp(Block):
         sig = self._couple[0].process(sig)
         sig = sig * sag_gain
 
-        # Tone stack. +/-15 dB, centred at 0.5.
-        self._bass.set(f0=m.tone_bass, gain_db=(self.bass - 0.5) * 30.0)
-        self._mid.set(f0=m.tone_mid, q=m.tone_mid_q, gain_db=(self.mid - 0.5) * 30.0)
-        self._treble.set(f0=m.tone_treble, gain_db=(self.treble - 0.5) * 30.0)
+        if modelled:
+            if not m.stack_pre:
+                sig = self._voicing_eq(sig, m)
+            elif m.geq:
+                for i, (f0, db) in enumerate(m.geq[:5]):
+                    self._geq[i].set(f0=f0, gain_db=db)
+                    sig = self._geq[i].process(sig)
+        else:
+            # Tone stack. +/-15 dB, centred at 0.5.
+            self._bass.set(f0=m.tone_bass, gain_db=(self.bass - 0.5) * 30.0)
+            self._mid.set(f0=m.tone_mid, q=m.tone_mid_q, gain_db=(self.mid - 0.5) * 30.0)
+            self._treble.set(f0=m.tone_treble, gain_db=(self.treble - 0.5) * 30.0)
+            sig = self._bass.process(sig)
+            sig = self._mid.process(sig)
+            sig = self._treble.process(sig)
         self._presence.set(f0=5200.0, gain_db=clampf(self.presence, 0.0, 1.0) * 14.0)
         self._out_lp.set(f0=m.out_lp)
-
-        sig = self._bass.process(sig)
-        sig = self._mid.process(sig)
-        sig = self._treble.process(sig)
         sig = self._presence.process(sig)
+        if m.power > 0.0:
+            # Power amp. Master drives the output valves as well as setting
+            # the level: on an amp without a master volume, turning up is
+            # what makes it break up, and the power-amp clipping is broader
+            # and more compressed than preamp clipping. Oversampled like the
+            # preamp. Divided back out so Master still reads as loudness.
+            mv = clampf(self.master, 0.0, 1.0)
+            k = m.power * (0.3 + 5.0 * mv * mv)
+            up = self._os_pa.up(sig * k)
+            if m.power_asym:
+                up = SHAPERS["tube"](up, 1.0, m.power_asym)
+            else:
+                up = np.tanh(up)
+            sig = self._os_pa.down(up) / k
         sig = self._out_lp.process(sig)
 
         self._master.set(db2lin(-40.0 + 46.0 * clampf(self.master, 0.0, 1.0)))
@@ -1194,3 +1271,8 @@ class Output(Block):
         self.peak_l = float(np.max(np.abs(y[0]))) if n else 0.0
         self.peak_r = float(np.max(np.abs(y[1]))) if n else 0.0
         return y
+
+
+# The circuit-modelled amp and cab voicings register themselves into
+# AMP_MODELS / CAB_MODELS / MIC_TILT. Imported last: it needs AmpModel.
+from . import voicings  # noqa: E402,F401

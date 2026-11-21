@@ -136,6 +136,7 @@ class Effect(Block):
         for p in self.PARAMS:
             setattr(self, p.name, p.default)
         self._t = 0    # absolute sample position, for the chunk grid
+        self._cell = None  # coefficients held for the current grid cell
 
     # -- description --------------------------------------------------------
 
@@ -170,6 +171,7 @@ class Effect(Block):
         if self.STEREO:
             self.channels = 2
         self._t = 0
+        self._cell = None
 
     def process(self, x):
         if not self.enabled:
@@ -191,6 +193,13 @@ class Effect(Block):
 # --------------------------------------------------------------------------
 # Absolute-position chunk grid
 # --------------------------------------------------------------------------
+
+def cell_start(t0: int, a: int, c: int) -> bool:
+    """True when piece ``a`` of a block starting at ``t0`` opens a new grid
+    cell. Swept filters compute coefficients only there and hold them for
+    the whole cell, so a cell split across two buffers sounds identical."""
+    return (t0 + a) % c == 0
+
 
 def grid(t0: int, n: int, c: int):
     """Split a block that starts at absolute sample ``t0`` into pieces whose

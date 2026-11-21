@@ -158,7 +158,7 @@ class OctaveUp(Effect):
 
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
-        self._oss = [Oversampler() for _ in range(self.channels)]
+        self._oss = [Oversampler(16) for _ in range(self.channels)]
         for o in self._oss:
             o.prepare(sr, max_block)
         self._hp = Biquad("highpass", 180.0, 0.707)
@@ -185,7 +185,9 @@ class OctaveUp(Effect):
         for ch in range(x.shape[0]):
             up = self._oss[ch].up(pre[ch])
             s = np.tanh(up * g)
-            r = np.abs(s) * 2.0 - 0.9          # rectified: the octave
+            # Rectified: the octave. sqrt(s^2 + e^2) is |s| with the corner
+            # rounded off, as a real diode's knee is, so it does not alias.
+            r = np.sqrt(s * s + 0.0225) * 2.0 - 0.95
             v = s * (1.0 - o) + r * o
             v = np.tanh(v * 1.8)
             wet[ch] = self._oss[ch].down(v)

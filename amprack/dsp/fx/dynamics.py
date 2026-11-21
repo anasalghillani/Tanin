@@ -214,12 +214,15 @@ class GraphicEQ(Effect):
         key = (self.model, gains)
         if key == self._key:
             return
-        # Octave-ish bands: Q follows the spacing so neighbours overlap the
-        # way a real graphic's sliders do.
-        ratio = bands[1] / bands[0]
-        q = math.sqrt(ratio) / (ratio - 1.0) * 1.1
+        # Q follows each band's local spacing (pedal graphics are not evenly
+        # spaced) so neighbours overlap like real sliders without piling up.
         sec = []
-        for f, g in zip(bands, gains):
+        n_b = len(bands)
+        for i, (f, g) in enumerate(zip(bands, gains)):
+            lo = bands[i] / bands[i - 1] if i > 0 else bands[1] / bands[0]
+            hi = bands[i + 1] / bands[i] if i < n_b - 1 else lo
+            ratio = math.sqrt(lo * hi)
+            q = math.sqrt(ratio) / (ratio - 1.0) * 1.4
             b, a = _rbj("peak", self.sr, f, q, g)
             sec.append(np.concatenate((b, a)))
         self._sos = np.array(sec)

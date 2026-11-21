@@ -6,11 +6,15 @@ The chain has three racks, matching where gear sits on a real rig:
 *   ``loop`` -- 4 stereo slots after the cab (the effects loop)
 *   ``rack`` -- 4 stereo slots at the very end (studio rack)
 
-Switching what a slot holds must not allocate on the audio thread (presets
-arrive through the engine's command queue and are applied there), so every
-slot keeps one *prepared* instance of every effect type and switching is a
-reference swap plus a state reset. That costs memory up front (measured in
-tools/fx_tests.py) and buys glitch-free tone switches mid-song.
+Switching what a slot holds should not allocate on the audio thread
+(presets arrive through the engine's command queue and are applied there).
+Each slot therefore keeps a pool of *prepared* instances, one per effect type
+it has ever held, and switching is a reference swap plus a state reset.
+Instances are built on demand on the control thread: ``Chain.preload(state)``
+(called by ``Engine.apply_preset`` before it queues the preset, and by
+play-along for every tone of a song before it starts) and ``set_type`` from
+the UI. Only a type that was never preloaded is built on the audio thread,
+as a fallback, at the cost of one late block.
 """
 
 from __future__ import annotations
@@ -43,16 +47,29 @@ class FxSlots(Block):
         self.stereo = channels == 2
         self.enabled = True
         self.slots = [Slot() for _ in range(n_slots)]
-        for s in self.slots:
-            for key, cls in FX_TYPES.items():
-                fx = cls()
-                fx.channels = 2 if cls.STEREO else channels
-                s.pool[key] = fx
+        self._prepared = False
 
     # -- lifecycle ----------------------------------------------------------
 
+    def _build(self, fx_type: str):
+        fx = FX_TYPES[fx_type]()
+        fx.channels = 2 if fx.STEREO else self.channels
+        if self._prepared:
+            fx.prepare(self.sr, self.max_block)
+            fx.reset()
+        return fx
+
+    def preload(self, i: int, fx_type: str) -> None:
+        """Make sure slot i has a prepared instance of fx_type. Control thread."""
+        if not 0 <= i < len(self.slots) or fx_type not in FX_TYPES:
+            return
+        pool = self.slots[i].pool
+        if fx_type not in pool:
+            pool[fx_type] = self._build(fx_type)
+
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
+        self._prepared = True
         for s in self.slots:
             for fx in s.pool.values():
                 fx.channels = 2 if fx.STEREO else self.channels
@@ -74,7 +91,11 @@ class FxSlots(Block):
         fx_type = fx_type if fx_type in FX_TYPES else ""
         if fx_type == s.type:
             return
-        new = s.pool.get(fx_type) if fx_type else None
+        new = None
+        if fx_type:
+            new = s.pool.get(fx_type)
+            if new is None:
+                new = s.pool[fx_type] = self._build(fx_type)
         if new is not None:
             new.reset()
             new.set_params({})
@@ -89,6 +110,17 @@ class FxSlots(Block):
         return any(s.fx is not None and s.enabled and s.fx.enabled for s in self.slots)
 
     # -- state (presets) ----------------------------------------------------
+
+    def preload_state(self, src) -> None:
+        """Build (off the audio thread) whatever ``apply_state(src)`` will need."""
+        if not isinstance(src, dict):
+            return
+        slots = src.get("slots", [])
+        if not isinstance(slots, list):
+            return
+        for i, d in enumerate(slots[:len(self.slots)]):
+            if isinstance(d, dict) and isinstance(d.get("type"), str):
+                self.preload(i, d["type"])
 
     def state(self) -> dict:
         return {

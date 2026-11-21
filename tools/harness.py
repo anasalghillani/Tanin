@@ -116,8 +116,15 @@ def test_sanity_all_models():
 
     worst = 0.0
     bad = []
-    for amp in AMP_MODELS:
-        for drive in DRIVE_MODELS:
+    # The original four amps run against every drive. The song-tone voicings
+    # (amprack/dsp/voicings.py) each run with one drive, cycling through
+    # them, so every amp and every drive is still covered without the run
+    # growing 6x; tools/fx_tests.py checks each voicing cranked on its own.
+    from amprack.dsp.voicings import NEW_AMPS
+    for ai, amp in enumerate(AMP_MODELS):
+        drives = (DRIVE_MODELS if amp not in NEW_AMPS
+                  else (list(DRIVE_MODELS)[ai % len(DRIVE_MODELS)],))
+        for drive in drives:
             c = Chain()
             c.prepare(SR, 256)
             c["drive"].enabled = True
@@ -961,6 +968,8 @@ def main():
     test_looper_safety()
     from dsp_tests import run_all as run_dsp_audit  # noqa: E402
     run_dsp_audit(check)
+    from fx_tests import run_all as run_fx_tests  # noqa: E402
+    run_fx_tests(check)
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)

@@ -400,6 +400,9 @@ class Engine:
                     err = f"Could not load IR {os.path.basename(path)}: " \
                           f"{type(exc).__name__}: {exc}"
 
+        # Slot effects the preset uses are built here, not on the audio thread.
+        self.chain.preload(state)
+
         def swap():
             if not keep:
                 blk.set_kernel(kernel, path if kernel is not None else "")

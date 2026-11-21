@@ -33,7 +33,7 @@ def clip_asym(v):
 
 def clip_hard_diode(v):
     """Silicon diodes to ground after an op-amp: a sharp knee."""
-    return v / (1.0 + np.abs(v) ** 5.0) ** 0.2
+    return v / (1.0 + np.abs(v) ** 3.5) ** (1.0 / 3.5)
 
 
 def clip_led(v):
@@ -59,6 +59,8 @@ CLIPPERS = {
 #            "zone" (active 3-band with sweepable mid)
 #   tone_lo, tone_hi: the tone circuit's range (Hz)
 #   out:     output trim so Level 0.5 is about unity loudness
+#   os:      oversampling factor (default 8). The hardest clippers make
+#            harmonics far past 8x Nyquist that fold back in; they run 16x.
 DIRT_MODELS = {
     "Green":      dict(hp=720.0, gain=(2.0, 110.0), gbw=0.0, clip="soft", dry=0.5,
                        tone="ts", tone_lo=700.0, tone_hi=5500.0, out=0.767),
@@ -66,11 +68,11 @@ DIRT_MODELS = {
                        tone="ts", tone_lo=900.0, tone_hi=6000.0, out=0.537),
     "Blues":      dict(hp=200.0, gain=(1.5, 70.0), gbw=0.0, clip="soft", dry=0.15,
                        tone="lp", tone_lo=1500.0, tone_hi=9000.0, out=0.525),
-    "Distortion": dict(hp=180.0, gain=(6.0, 700.0), gbw=0.0, clip="hard", dry=0.0,
+    "Distortion": dict(os=16, hp=180.0, gain=(6.0, 700.0), gbw=0.0, clip="hard", dry=0.0,
                        tone="scoop", tone_lo=450.0, tone_hi=1700.0, out=0.363),
-    "Rodent":     dict(hp=60.0, gain=(4.0, 2000.0), gbw=900000.0, clip="hard", dry=0.0,
+    "Rodent":     dict(os=16, hp=60.0, gain=(4.0, 2000.0), gbw=900000.0, clip="hard", dry=0.0,
                        tone="rat", tone_lo=480.0, tone_hi=16000.0, out=0.196),
-    "Zone":       dict(hp=90.0, gain=(30.0, 4000.0), gbw=0.0, clip="zone", dry=0.0,
+    "Zone":       dict(os=16, hp=90.0, gain=(30.0, 4000.0), gbw=0.0, clip="zone", dry=0.0,
                        tone="zone", tone_lo=200.0, tone_hi=5000.0, out=0.186),
     "Muff":       dict(hp=100.0, gain=(8.0, 900.0), gbw=0.0, clip="muff", dry=0.0,
                        tone="scoop", tone_lo=400.0, tone_hi=1300.0, out=0.306),
@@ -78,7 +80,7 @@ DIRT_MODELS = {
                        tone="lp", tone_lo=2000.0, tone_hi=7000.0, out=0.349, sag=0.6),
     "Si Fuzz":    dict(hp=60.0, gain=(8.0, 400.0), gbw=0.0, clip="transistor", dry=0.0,
                        tone="lp", tone_lo=2500.0, tone_hi=9000.0, out=0.282, sag=0.35),
-    "Gated Fuzz": dict(hp=250.0, gain=(20.0, 800.0), gbw=0.0, clip="transistor", dry=0.0,
+    "Gated Fuzz": dict(os=16, hp=250.0, gain=(20.0, 800.0), gbw=0.0, clip="transistor", dry=0.0,
                        tone="lp", tone_lo=1800.0, tone_hi=6000.0, out=0.309, sag=1.0,
                        gate=1.0),
 }
@@ -109,31 +111,29 @@ class Dirt(Effect):
     def prepare(self, sr, max_block):
         super().prepare(sr, max_block)
         c = self.channels
-        self._oss = [Oversampler() for _ in range(c)]
-        for o in self._oss:
-            o.prepare(sr, max_block)
+        self._oss = {f: [Oversampler(f) for _ in range(c)] for f in (8, 16)}
+        for lst in self._oss.values():
+            for o in lst:
+                o.prepare(sr, max_block)
         self._hp = Biquad("highpass", 700.0, 0.707)
         self._gbw = Biquad("lowpass", 8000.0, 0.707)
-        self._pre_peak = Biquad("peak", 1000.0, 0.8, 0.0)
-        self._inter = Biquad("lowpass", 4000.0, 0.707)
-        self._inter_hp = Biquad("highpass", 100.0, 0.707)
         self._lp = Biquad("lowpass", 4000.0, 0.707)
         self._lp2 = Biquad("lowpass", 9000.0, 0.707)
         self._shp = Biquad("highpass", 1000.0, 0.707)
         self._lo = Biquad("lowshelf", 120.0, 0.707)
         self._mid = Biquad("peak", 800.0, 1.0)
         self._hi = Biquad("highshelf", 3200.0, 0.707)
-        for f in (self._hp, self._gbw, self._pre_peak, self._lp, self._lp2,
+        for f in (self._hp, self._gbw, self._lp, self._lp2,
                   self._shp, self._lo, self._mid, self._hi):
             f.prepare(sr, c)
         # Inter-stage filters run at the oversampled rate.
-        for f in (self._inter, self._inter_hp):
-            f.prepare(sr * 8, 1)
-        self._inters = [(Biquad("lowpass", 4000.0, 0.707), Biquad("highpass", 100.0, 0.707))
-                        for _ in range(c)]
-        for lp, hp in self._inters:
-            lp.prepare(sr * 8, 1)
-            hp.prepare(sr * 8, 1)
+        self._inters = {}
+        for fac in (8, 16):
+            self._inters[fac] = [(Biquad("lowpass", 4000.0, 0.707),
+                                  Biquad("highpass", 100.0, 0.707)) for _ in range(c)]
+            for lp, hp in self._inters[fac]:
+                lp.prepare(sr * fac, 1)
+                hp.prepare(sr * fac, 1)
         self._dc = DCBlocker()
         self._dc.prepare(sr, c)
         self._env = OnePole(25.0)
@@ -146,19 +146,21 @@ class Dirt(Effect):
         self._mixs.prepare(max_block)
 
     def reset(self):
-        for o in self._oss:
-            o.reset()
-        for f in (self._hp, self._gbw, self._pre_peak, self._lp, self._lp2,
+        for lst in self._oss.values():
+            for o in lst:
+                o.reset()
+        for f in (self._hp, self._gbw, self._lp, self._lp2,
                   self._shp, self._lo, self._mid, self._hi):
             f.reset()
-        for lp, hp in self._inters:
-            lp.reset()
-            hp.reset()
+        for lst in self._inters.values():
+            for lp, hp in lst:
+                lp.reset()
+                hp.reset()
         self._dc.reset()
         self._env.reset()
         self._gate_env.reset()
 
-    def _clip(self, up, ch, spec, gain, bias_s, env_up):
+    def _clip(self, up, ch, spec, gain, bias_s, env_up, fac):
         kind = spec["clip"]
         if kind in CLIPPERS:
             return CLIPPERS[kind](up * gain)
@@ -166,7 +168,7 @@ class Dirt(Effect):
             # Two cascaded transistor clipping stages with the coupling
             # filters between them: the long, smooth sustain.
             g = math.sqrt(gain)
-            lp, hp = self._inters[ch]
+            lp, hp = self._inters[fac][ch]
             lp.set(f0=3500.0)
             hp.set(f0=90.0)
             s = clip_soft_diode(up * g)
@@ -175,13 +177,13 @@ class Dirt(Effect):
         if kind == "zone":
             # Three stages, the middle one hard: dense, compressed, tight.
             g = gain ** (1.0 / 3.0)
-            lp, hp = self._inters[ch]
+            lp, hp = self._inters[fac][ch]
             lp.set(f0=5000.0)
             hp.set(f0=160.0)
             s = clip_soft_diode(up * g)
             s = lp.process(hp.process(s))
             s = clip_hard_diode(s * g)
-            return clip_hard_diode(s * g * 0.7)
+            return clip_soft_diode(s * g * 0.7)
         # Transistor fuzz: the bias sags with the playing (blocking
         # distortion) so a hard-hit note chokes then blooms.
         sag = spec.get("sag", 0.5)
@@ -212,11 +214,13 @@ class Dirt(Effect):
         env = self._env.process(np.abs(mono)) * min(gain, 50.0)
         bias = clampf(self.bias, 0.0, 1.0)
         wet = np.empty_like(x)
+        fac = spec.get("os", 8)
         for ch in range(x.shape[0]):
-            up = self._oss[ch].up(pre[ch])
-            env_up = np.repeat(env, 8) if spec["clip"] == "transistor" else 0.0
-            s = self._clip(up, ch, spec, gain, bias, env_up)
-            wet[ch] = self._oss[ch].down(s)
+            os_ = self._oss[fac][ch]
+            up = os_.up(pre[ch])
+            env_up = np.repeat(env, fac) if spec["clip"] == "transistor" else 0.0
+            s = self._clip(up, ch, spec, gain, bias, env_up, fac)
+            wet[ch] = os_.down(s)
         wet = self._dc.process(wet)
         if spec["dry"]:
             wet = wet + pre * spec["dry"]
