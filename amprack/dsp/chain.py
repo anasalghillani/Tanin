@@ -17,11 +17,16 @@ from .blocks import (
     Reverb,
 )
 from .core import SmoothedParam, clampf, db2lin, sanitize
+from .fx.slots import FxSlots
 
 # Order matters and matches how these are wired on a real board: dynamics and
 # dirt in front of the amp, time-based effects after the cab where they belong.
-MONO_ORDER = ("gate", "comp", "drive", "amp", "cab", "ir")
-STEREO_ORDER = ("mod", "delay", "reverb")
+# "pre", "loop" and "rack" are slot racks that can hold any slot effect
+# (amprack/dsp/fx): stomp boxes before the amp, an effects loop after the
+# cab, and a studio rack at the very end. Empty racks pass audio untouched.
+MONO_ORDER = ("gate", "comp", "pre", "drive", "amp", "cab", "ir")
+STEREO_ORDER = ("loop", "mod", "delay", "reverb", "rack")
+SLOT_RACKS = ("pre", "loop", "rack")
 
 
 class Chain:
@@ -37,6 +42,9 @@ class Chain:
             "delay": Delay(),
             "reverb": Reverb(),
             "output": Output(),
+            "pre": FxSlots("pre", channels=1),
+            "loop": FxSlots("loop", channels=2),
+            "rack": FxSlots("rack", channels=2),
         }
         self.input_gain_db = 0.0
         self.global_bypass = False
@@ -108,11 +116,21 @@ class Chain:
         "output": ("enabled", "volume_db", "width"),
     }
 
+    def preload(self, state: dict) -> None:
+        """Build any slot effects ``state`` uses, so that ``apply(state)`` on
+        the audio thread is only reference swaps. Call off the audio thread."""
+        if not isinstance(state, dict):
+            return
+        for key in SLOT_RACKS:
+            self.blocks[key].preload_state(state.get(key))
+
     def snapshot(self) -> dict:
         state = {"input_gain_db": self.input_gain_db}
         for key, names in self.PARAM_SPEC.items():
             b = self.blocks[key]
             state[key] = {nm: getattr(b, nm) for nm in names}
+        for key in SLOT_RACKS:
+            state[key] = self.blocks[key].state()
         return state
 
     def apply(self, state: dict) -> None:
@@ -148,6 +166,9 @@ class Chain:
                 if nm == "ir_path":
                     continue
                 setattr(b, nm, _coerce(src.get(nm, defaults[nm]), defaults[nm]))
+        # Slot racks: missing means empty, like any other omitted block.
+        for key in SLOT_RACKS:
+            self.blocks[key].apply_state(state.get(key))
 
 
 def _coerce(value, default):

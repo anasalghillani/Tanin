@@ -457,12 +457,19 @@ class Oversampler:
         self.sr_os = 48000.0 * factor
         self._sos = None
 
+    _designs: dict = {}   # (factor, order, sr) -> sos; the design is pure
+
     def prepare(self, sr: float, max_block: int) -> None:
         from scipy.signal import ellip
         self.sr_os = sr * self.factor
-        cutoff = min(19000.0, 0.42 * sr)
-        self._sos = ellip(self.order, 0.05, 100.0, cutoff / (self.sr_os * 0.5),
-                          output="sos")
+        key = (self.factor, self.order, float(sr))
+        sos = Oversampler._designs.get(key)
+        if sos is None:
+            cutoff = min(19000.0, 0.42 * sr)
+            sos = ellip(self.order, 0.05, 100.0, cutoff / (self.sr_os * 0.5),
+                        output="sos")
+            Oversampler._designs[key] = sos
+        self._sos = sos
         self._zi_up = np.zeros((self._sos.shape[0], 2), dtype=np.float64)
         self._zi_dn = np.zeros((self._sos.shape[0], 2), dtype=np.float64)
         self._os_buf = np.zeros(max_block * self.factor, dtype=np.float64)
