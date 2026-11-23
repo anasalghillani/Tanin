@@ -70,7 +70,14 @@ amprack/
   dsp/scales.py     keys, 12 scales (incl. Custom), C1..C6 range, snapping
   dsp/vocal_blocks.py  DeEsser, VocalEQ, Saturation, Doubler
   ui/vocals_panel.py   temporary Vocals tab in the dock (until phase 4)
-tools/harness.py    offline test suite (suite_tests.py = phases 1-2)
+  dsp/fx/sidechain.py  mic sidechain: engine copies the Vocals input into
+                    sidechain.MIC each block, before any instrument runs
+  dsp/fx/talkbox.py    Talkbox slot effect: Vowel (LPC formant tracking, 3
+                    resonators) and Vocoder (16 bands). Level follows the
+                    guitar, never the mic (speaker safe); auto noise-floor
+                    gate; fades the dry voice to its Voice knob
+tools/harness.py    offline test suite (suite_tests.py = phases 1-2,
+                    talkbox_tests.py = talkbox + mic sidechain)
 tools/bench_instruments.py  callback load with 3 instruments at 128/256
 settings.json       saved devices (by NAME + API, not by index), channel, Stream Out
 ```

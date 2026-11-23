@@ -13,10 +13,11 @@ from .dynamics import Comp, Gate, GraphicEQ, ParametricEQ
 from .filters import AutoFilter, BitCrusher, LoFi, Wah
 from .mod import Chorus, Flanger, Phaser, Rotary, Tremolo, Vibe
 from .pitch import OctaveDown, OctaveUp, PitchShift
+from .talkbox import Talkbox
 from .time import Echo, Verb
 
 _ALL = (
-    Wah, AutoFilter, LoFi, BitCrusher,
+    Wah, AutoFilter, LoFi, BitCrusher, Talkbox,
     OctaveDown, OctaveUp, PitchShift,
     Chorus, Flanger, Phaser, Vibe, Tremolo, Rotary,
     Echo, Verb,

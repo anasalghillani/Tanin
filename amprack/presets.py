@@ -71,6 +71,24 @@ FACTORY: dict[str, dict] = {
                    "mix": 0.24, "predelay_ms": 24.0},
         "output": {"volume_db": -7.0},
     },
+    # Talk through the guitar: mic on the Vocals input, headphones or speakers
+    # both work (the talkbox follows your mouth's shape, never its volume).
+    "Talk Box": {
+        "amp": {"model": "Crunch", "gain": 0.62, "bass": 0.45, "mid": 0.7,
+                "treble": 0.6, "presence": 0.5, "master": 0.55, "sag": 0.35},
+        "cab": {"enabled": True, "model": "4x12 Modern", "mic": "Dynamic",
+                "position": 0.55, "distance": 0.25},
+        "drive": {"enabled": True, "model": "Screamer", "drive": 0.45,
+                  "tone": 0.6, "level": 0.55, "mix": 1.0},
+        "gate": {"enabled": True, "threshold_db": -55.0},
+        "mod": {"enabled": False},
+        "loop": {"slots": [{"type": "talkbox", "params": {"model": "Vowel"}}]},
+        "delay": {"enabled": True, "mode": "Analog", "time_ms": 380.0,
+                  "feedback": 0.25, "mix": 0.18, "tone": 0.45},
+        "reverb": {"enabled": True, "mode": "Room", "size": 0.4, "damping": 0.5,
+                   "mix": 0.15, "predelay_ms": 10.0},
+        "output": {"volume_db": -7.0},
+    },
     "Metal Chug": {
         "amp": {"model": "Metal", "gain": 0.78, "bass": 0.6, "mid": 0.38,
                 "treble": 0.62, "presence": 0.55, "master": 0.5, "sag": 0.2},

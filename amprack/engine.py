@@ -31,6 +31,7 @@ import sounddevice as sd  # noqa: E402
 
 from .dsp.chain import Chain
 from .instruments import GuitarInstrument, VocalsInstrument
+from .dsp.fx import sidechain as _sidechain
 from .looper import Looper
 from .mixer import BUSES, Mixer
 from .recorder import Recorder
@@ -274,6 +275,10 @@ class Engine:
         self.vocals = VocalsInstrument(input_channel=1)
         self.instruments = [self.guitar, self.vocals]
         self.mixer = Mixer([i.key for i in self.instruments])
+        # The mic, handed to effects that need it (the talkbox) in the same
+        # block. It follows the Vocals input, so set the mic jack there.
+        self.sidechain = _sidechain.MIC
+        self._voice_gain = 1.0
         self.looper = Looper()
         self.looper.post = self.post   # loop buttons land between blocks
         self.recorder = Recorder(recordings_dir)
@@ -327,6 +332,7 @@ class Engine:
         self._outs: list = [None] * len(self.instruments)
         self._click = np.zeros((2, 0), dtype=np.float64)
         self._loop_part = np.zeros((2, 0), dtype=np.float64)
+        self._vox = np.zeros((2, 0), dtype=np.float64)
         self._deadline = 1.0
 
     # -- instruments -------------------------------------------------------
@@ -584,6 +590,7 @@ class Engine:
 
     def stop(self) -> None:
         self.broadcast.stop()
+        self.sidechain.clear()
         s = self.stream
         self.stream = None
         self.running = False
@@ -635,6 +642,9 @@ class Engine:
         self._mono_in = np.zeros(n, dtype=np.float64)
         self._click = np.zeros((2, n), dtype=np.float64)
         self._loop_part = np.zeros((2, n), dtype=np.float64)
+        self._vox = np.zeros((2, n), dtype=np.float64)
+        self.sidechain.prepare(n)
+        self._voice_gain = 1.0
         self._outs = [None] * len(self.instruments)
         self._deadline = n / sr
         self.xruns = 0
@@ -701,6 +711,16 @@ class Engine:
             mono = indata[:, gch].astype(np.float64)
             self.input_ring.push(indata[:, gch], n)
 
+            # The mic sidechain: the Vocals input, whether or not Vocals is
+            # on, so a talkbox works with the dry voice switched off.
+            sc = self.sidechain
+            vch = self.vocals.input_channel
+            if vch is None or vch >= nch:
+                vch = 0
+            sc.write(indata[:, vch], n)
+            sc.claimed = False
+            sc.voice_gain = 1.0
+
             # Every enabled instrument reads its own input and runs its
             # own chain. Off means skipped: no CPU.
             outs = self._outs
@@ -720,6 +740,22 @@ class Engine:
                 else:
                     src = None
                 outs[i] = inst.process(src, n)
+
+            # A talkbox that is shaping sound fades the dry voice down (its
+            # Voice knob), ramped per block so it never clicks.
+            target = sc.voice_gain if sc.claimed else 1.0
+            g0 = self._voice_gain
+            g1 = g0 + (target - g0) * 0.5 if abs(target - g0) > 1e-4 else target
+            self._voice_gain = g1
+            if g0 < 1.0 or g1 < 1.0:
+                for i, inst in enumerate(self.instruments):
+                    if inst is self.vocals and outs[i] is not None:
+                        v = self._vox[:, :n]
+                        np.multiply(self._ramp[:n], g1 - g0, out=v[0])
+                        v[0] += g0
+                        v[1] = v[0]
+                        np.multiply(outs[i], v, out=v)
+                        outs[i] = v
 
             # Strips and sends -> phones / record / stream buses.
             self.mixer.process(outs, n)
