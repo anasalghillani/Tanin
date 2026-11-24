@@ -972,6 +972,8 @@ def main():
     run_suite(check)
     from fx_tests import run_all as run_fx_tests  # noqa: E402
     run_fx_tests(check)
+    from talkbox_tests import run_all as run_talkbox_tests  # noqa: E402
+    run_talkbox_tests(check)
     dt = time.perf_counter() - t0
 
     print("\n" + "=" * 68)
